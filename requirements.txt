@@ -1,0 +1,7 @@
+PyQt5
+aiohttp
+scikit-learn
+joblib
+validators
+numpy
+getmac
