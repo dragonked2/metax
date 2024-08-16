@@ -51,7 +51,8 @@ MetaX is a cutting-edge XSS (Cross-Site Scripting) vulnerability detector design
 
 ### **Scan Results**
 ![image](https://github.com/user-attachments/assets/060f8446-3b1f-4c58-8a4b-a553384e2ad7)
-<!-- Replace with actual screenshot -->
+
+![image](https://github.com/user-attachments/assets/4bb9a7ab-9d7d-4990-bcce-1f76a60d3b9d)
 
 ## 📈 **Performance**
 
