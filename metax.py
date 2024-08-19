@@ -35,7 +35,8 @@ class XSSDetector:
 
         payloads = self.config['payload_injections']
         labels = [label_payload(payload) for payload in payloads]
-        X = TfidfVectorizer(max_features=30000, ngram_range=(1, 2)).fit_transform(payloads).toarray()
+        vectorizer = TfidfVectorizer(max_features=30000, ngram_range=(1, 2))
+        X = vectorizer.fit_transform(payloads).toarray()
 
         pipeline = Pipeline([
             ('clf', RandomForestClassifier(n_estimators=2000, max_depth=40, random_state=42))
@@ -52,7 +53,7 @@ class XSSDetector:
         logging.info(f"Model F1 score: {f1_score(y_test, y_pred)}")
 
         dump(best_pipeline, 'xss_model.joblib')
-        dump(TfidfVectorizer(max_features=30000, ngram_range=(1, 2)), 'tfidf_vectorizer.joblib')
+        dump(vectorizer, 'tfidf_vectorizer.joblib')
 
     def load_model(self):
         if not os.path.exists('xss_model.joblib') or not os.path.exists('tfidf_vectorizer.joblib'):
